@@ -85,6 +85,19 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+        
+        # # === 监控 logits 数值 ===
+        # if self.use_nan_detection:
+        #     with torch.no_grad():
+        #         if not torch.isfinite(logits).all():
+        #             print("[DEBUG] logits invalid BEFORE temperature / softmax")
+        #             finite_mask = torch.isfinite(logits)
+        #             if finite_mask.any():
+        #                 finite_vals = logits[finite_mask]
+        #                 print("  logits finite min:", finite_vals.min().item(),
+        #                       "max:", finite_vals.max().item())
+        #             print("  nan count:", torch.isnan(logits).sum().item())
+        #             print("  inf count:", torch.isinf(logits).sum().item())
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
@@ -115,6 +128,25 @@ class Sampler(nn.Module):
             logits[:] = torch.softmax(logits, dim=-1)
             probs = logits
             del logits
+            
+            # # Post process logits
+            # logits.div_(sampling_info.temperatures)
+            # logits[:] = torch.softmax(logits, dim=-1)
+            # probs = logits
+
+            # if self.use_nan_detection:
+            #     with torch.no_grad():
+            #         if (not torch.isfinite(probs).all()) or (probs < 0).any():
+            #             print("[DEBUG] probs invalid AFTER softmax in Sampler")
+            #             # 只打印一部分统计，避免太长
+            #             finite_mask = torch.isfinite(probs)
+            #             if finite_mask.any():
+            #                 finite_vals = probs[finite_mask]
+            #                 print("  probs finite min:", finite_vals.min().item(),
+            #                       "max:", finite_vals.max().item())
+            #             print("  nan count:", torch.isnan(probs).sum().item())
+            #             print("  neg count:", (probs < 0).sum().item())
+            #             print("  >1 count:", (probs > 1).sum().item())
 
             if can_sample_directly_from_probs:
                 # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
@@ -333,6 +365,19 @@ def sampling_from_probs_torch(
     if sampling_seed is not None:
         sampled_index = multinomial_with_seed(probs, sampling_seed, positions)
     else:
+        # with torch.no_grad():
+        #     # 先检查一下数值情况
+        #     if not torch.isfinite(probs).all() or (probs < 0).any():
+        #         print("[DEBUG] probs invalid:")
+        #         print("  min:", probs.min().item(), "max:", probs.max().item())
+        #         print("  nan count:", torch.isnan(probs).sum().item())
+        #         print("  neg count:", (probs < 0).sum().item())
+        #         # 强行修一下，避免直接 device assert
+        #         probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        #         probs = torch.clamp(probs, min=0.0)
+        #         sums = probs.sum(dim=-1, keepdim=True)
+        #         # 避免除 0
+        #         probs = torch.where(sums > 0, probs / sums, torch.full_like(probs, 1.0 / probs.shape[-1]))
         sampled_index = torch.multinomial(probs, num_samples=1)
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
     return batch_next_token_ids

@@ -13,7 +13,7 @@ from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
-from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig, Qwen3KimiConfig
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
@@ -35,6 +35,7 @@ __all__ = [
     "Olmo3Config",
     "KimiLinearConfig",
     "Qwen3NextConfig",
+    "Qwen3KimiConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
     "FalconH1Config",

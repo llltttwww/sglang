@@ -1,0 +1,211 @@
+root@gpu-lg-cmc-h-h200-2563:/sgl-workspace/sglang# bash /sgl-workspace/sglang/comp_params.sh
+[Slime] Successfully registered 'qwen3_kimi' config.
+[Slime] Successfully registered 'qwen3_kimi' tokenizer mapping.
+============================================================
+[STEP 1] Scanning checkpoint in /mnt/shared-storage-user/p1-shared/luotianwei/hf_cache/hub/models--yuchenFan--Qwen3-Next-Kimi-1204/snapshots/fccadc7499f8a9bcef45f30f409143e01640bef7
+[INFO] Found safetensors files: ['model-00000-of-00001.safetensors']
+[INFO] Loading /mnt/shared-storage-user/p1-shared/luotianwei/hf_cache/hub/models--yuchenFan--Qwen3-Next-Kimi-1204/snapshots/fccadc7499f8a9bcef45f30f409143e01640bef7/model-00000-of-00001.safetensors ...
+[INFO] #ckpt params: 3366
+  Example ckpt keys:
+   - lm_head.weight
+   - model.embed_tokens.weight
+   - model.layers.0.input_layernorm.weight
+   - model.layers.0.linear_attn.A_log
+   - model.layers.0.linear_attn.b_proj.weight
+   - model.layers.0.linear_attn.dt_bias
+   - model.layers.0.linear_attn.f_a_proj.weight
+   - model.layers.0.linear_attn.f_b_proj.weight
+   - model.layers.0.linear_attn.g_a_proj.weight
+   - model.layers.0.linear_attn.g_b_proj.weight
+   - model.layers.0.linear_attn.k_conv1d.weight
+   - model.layers.0.linear_attn.k_proj.weight
+   - model.layers.0.linear_attn.o_norm.weight
+   - model.layers.0.linear_attn.o_proj.weight
+   - model.layers.0.linear_attn.q_conv1d.weight
+   - model.layers.0.linear_attn.q_proj.weight
+   - model.layers.0.linear_attn.v_conv1d.weight
+   - model.layers.0.linear_attn.v_proj.weight
+   - model.layers.0.mlp.experts.0.down_proj.weight
+   - model.layers.0.mlp.experts.0.gate_proj.weight
+============================================================
+[STEP 2] Building HF Qwen3Next model and listing param names
+[INFO] Loading HF config via AutoConfig.from_pretrained from /mnt/shared-storage-user/p1-shared/luotianwei/hf_cache/hub/models--yuchenFan--Qwen3-Next-Kimi-1204/snapshots/fccadc7499f8a9bcef45f30f409143e01640bef7
+[INFO] HF Config class: <class 'sglang.srt.utils.hf_transformers_utils.Qwen3KimiConfig'>
+[INFO] config.model_type: qwen3_kimi
+[INFO] config.architectures: ['Qwen3NextForCausalLM']
+[INFO] Building transformers.models.qwen3_next.Qwen3NextForCausalLM ...
+The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+[INFO] Built HF model, total params: 2082.3M
+[INFO] #HF model params: 3076
+  Example HF model keys:
+   - lm_head.weight
+   - model.embed_tokens.weight
+   - model.layers.0.input_layernorm.weight
+   - model.layers.0.linear_attn.A_log
+   - model.layers.0.linear_attn.conv1d.weight
+   - model.layers.0.linear_attn.dt_bias
+   - model.layers.0.linear_attn.in_proj_ba.weight
+   - model.layers.0.linear_attn.in_proj_qkvz.weight
+   - model.layers.0.linear_attn.norm.weight
+   - model.layers.0.linear_attn.out_proj.weight
+   - model.layers.0.mlp.experts.0.down_proj.weight
+   - model.layers.0.mlp.experts.0.gate_proj.weight
+   - model.layers.0.mlp.experts.0.up_proj.weight
+   - model.layers.0.mlp.experts.1.down_proj.weight
+   - model.layers.0.mlp.experts.1.gate_proj.weight
+   - model.layers.0.mlp.experts.1.up_proj.weight
+   - model.layers.0.mlp.experts.10.down_proj.weight
+   - model.layers.0.mlp.experts.10.gate_proj.weight
+   - model.layers.0.mlp.experts.10.up_proj.weight
+   - model.layers.0.mlp.experts.11.down_proj.weight
+============================================================
+[STEP 3] Compare name sets
+[INFO] #params only in HF model (not in ckpt): 105
+   [HFONLY] model.layers.0.linear_attn.conv1d.weight
+   [HFONLY] model.layers.0.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.0.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.0.linear_attn.norm.weight
+   [HFONLY] model.layers.0.linear_attn.out_proj.weight
+   [HFONLY] model.layers.1.linear_attn.conv1d.weight
+   [HFONLY] model.layers.1.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.1.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.1.linear_attn.norm.weight
+   [HFONLY] model.layers.1.linear_attn.out_proj.weight
+   [HFONLY] model.layers.10.linear_attn.conv1d.weight
+   [HFONLY] model.layers.10.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.10.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.10.linear_attn.norm.weight
+   [HFONLY] model.layers.10.linear_attn.out_proj.weight
+   [HFONLY] model.layers.12.linear_attn.conv1d.weight
+   [HFONLY] model.layers.12.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.12.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.12.linear_attn.norm.weight
+   [HFONLY] model.layers.12.linear_attn.out_proj.weight
+   [HFONLY] model.layers.13.linear_attn.conv1d.weight
+   [HFONLY] model.layers.13.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.13.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.13.linear_attn.norm.weight
+   [HFONLY] model.layers.13.linear_attn.out_proj.weight
+   [HFONLY] model.layers.14.linear_attn.conv1d.weight
+   [HFONLY] model.layers.14.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.14.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.14.linear_attn.norm.weight
+   [HFONLY] model.layers.14.linear_attn.out_proj.weight
+   [HFONLY] model.layers.16.linear_attn.conv1d.weight
+   [HFONLY] model.layers.16.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.16.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.16.linear_attn.norm.weight
+   [HFONLY] model.layers.16.linear_attn.out_proj.weight
+   [HFONLY] model.layers.17.linear_attn.conv1d.weight
+   [HFONLY] model.layers.17.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.17.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.17.linear_attn.norm.weight
+   [HFONLY] model.layers.17.linear_attn.out_proj.weight
+   [HFONLY] model.layers.18.linear_attn.conv1d.weight
+   [HFONLY] model.layers.18.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.18.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.18.linear_attn.norm.weight
+   [HFONLY] model.layers.18.linear_attn.out_proj.weight
+   [HFONLY] model.layers.2.linear_attn.conv1d.weight
+   [HFONLY] model.layers.2.linear_attn.in_proj_ba.weight
+   [HFONLY] model.layers.2.linear_attn.in_proj_qkvz.weight
+   [HFONLY] model.layers.2.linear_attn.norm.weight
+   [HFONLY] model.layers.2.linear_attn.out_proj.weight
+------------------------------------------------------------
+[INFO] #params only in ckpt (not in HF model): 395
+   [CKPTONLY] model.layers.0.linear_attn.b_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.f_a_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.f_b_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.g_a_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.g_b_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.k_conv1d.weight
+   [CKPTONLY] model.layers.0.linear_attn.k_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.o_norm.weight
+   [CKPTONLY] model.layers.0.linear_attn.o_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.q_conv1d.weight
+   [CKPTONLY] model.layers.0.linear_attn.q_proj.weight
+   [CKPTONLY] model.layers.0.linear_attn.v_conv1d.weight
+   [CKPTONLY] model.layers.0.linear_attn.v_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.b_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.f_a_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.f_b_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.g_a_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.g_b_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.k_conv1d.weight
+   [CKPTONLY] model.layers.1.linear_attn.k_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.o_norm.weight
+   [CKPTONLY] model.layers.1.linear_attn.o_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.q_conv1d.weight
+   [CKPTONLY] model.layers.1.linear_attn.q_proj.weight
+   [CKPTONLY] model.layers.1.linear_attn.v_conv1d.weight
+   [CKPTONLY] model.layers.1.linear_attn.v_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.b_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.f_a_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.f_b_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.g_a_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.g_b_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.k_conv1d.weight
+   [CKPTONLY] model.layers.10.linear_attn.k_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.o_norm.weight
+   [CKPTONLY] model.layers.10.linear_attn.o_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.q_conv1d.weight
+   [CKPTONLY] model.layers.10.linear_attn.q_proj.weight
+   [CKPTONLY] model.layers.10.linear_attn.v_conv1d.weight
+   [CKPTONLY] model.layers.10.linear_attn.v_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.b_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.f_a_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.f_b_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.g_a_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.g_b_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.k_conv1d.weight
+   [CKPTONLY] model.layers.12.linear_attn.k_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.o_norm.weight
+   [CKPTONLY] model.layers.12.linear_attn.o_proj.weight
+   [CKPTONLY] model.layers.12.linear_attn.q_conv1d.weight
+   [CKPTONLY] model.layers.12.linear_attn.q_proj.weight
+============================================================
+[INFO] Top prefixes only in HF model:
+   model.layers.0: 5 keys
+   model.layers.1: 5 keys
+   model.layers.10: 5 keys
+   model.layers.12: 5 keys
+   model.layers.13: 5 keys
+   model.layers.14: 5 keys
+   model.layers.16: 5 keys
+   model.layers.17: 5 keys
+   model.layers.18: 5 keys
+   model.layers.2: 5 keys
+   model.layers.20: 5 keys
+   model.layers.21: 5 keys
+   model.layers.22: 5 keys
+   model.layers.24: 5 keys
+   model.layers.25: 5 keys
+   model.layers.26: 5 keys
+   model.layers.4: 5 keys
+   model.layers.5: 5 keys
+   model.layers.6: 5 keys
+   model.layers.8: 5 keys
+------------------------------------------------------------
+[INFO] Top prefixes only in ckpt:
+   mtp.layers.0: 122 keys
+   model.layers.0: 13 keys
+   model.layers.1: 13 keys
+   model.layers.10: 13 keys
+   model.layers.12: 13 keys
+   model.layers.13: 13 keys
+   model.layers.14: 13 keys
+   model.layers.16: 13 keys
+   model.layers.17: 13 keys
+   model.layers.18: 13 keys
+   model.layers.2: 13 keys
+   model.layers.20: 13 keys
+   model.layers.21: 13 keys
+   model.layers.22: 13 keys
+   model.layers.24: 13 keys
+   model.layers.25: 13 keys
+   model.layers.26: 13 keys
+   model.layers.4: 13 keys
+   model.layers.5: 13 keys
+   model.layers.6: 13 keys
+============================================================
+[DONE] Now you can inspect which modules differ (e.g. k_norm, v_norm, gates, delta/kda, etc.)

@@ -4,12 +4,14 @@ from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
+from einops import rearrange
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-from sglang.srt.distributed import divide, get_pp_group
+from sglang.srt.distributed import divide, get_pp_group, get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -22,6 +24,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    ReplicatedLinear
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -447,6 +450,200 @@ class Qwen3GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+class Qwen3KimiDeltaAttention(nn.Module):
+    def __init__(
+        self,
+        config: Qwen3NextConfig,      # 这里传的是你的 qwen3_kimi config
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        # 用 attention tp，而不是 get_tensor_model_parallel_world_size
+        self.tp_size = get_attention_tp_size()
+        self.hidden_size = config.hidden_size
+        self.layer_idx = layer_id
+        self.config = config
+        self.prefix = prefix
+
+        # ====== 关键：用 linear_* 这几个字段 ======
+        self.head_dim = config.linear_value_head_dim      # 128
+        self.num_heads = config.linear_num_value_heads    # 16
+        assert self.num_heads % self.tp_size == 0
+        self.local_num_heads = divide(self.num_heads, self.tp_size)
+
+        projection_size = self.head_dim * self.num_heads      # 128 * 16 = 2048
+        self.conv_size = config.linear_conv_kernel_dim        # 4
+
+        # ====== 下面基本照 KimiDeltaAttention 抄 ======
+        self.q_proj = ColumnParallelLinear(
+            self.hidden_size,
+            projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ColumnParallelLinear(
+            self.hidden_size,
+            projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.v_proj = ColumnParallelLinear(
+            self.hidden_size,
+            projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.v_proj",
+        )
+
+        self.f_a_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.f_a_proj",
+        )
+
+        self.f_b_proj = ColumnParallelLinear(
+            self.head_dim,
+            projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.f_b_proj",
+        )
+
+        self.dt_bias = nn.Parameter(
+            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
+        )
+        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+
+        self.b_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.b_proj",
+        )
+
+        self.q_conv1d = ColumnParallelLinear(
+            input_size=self.conv_size,
+            output_size=projection_size,
+            bias=False,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.q_conv1d",
+        )
+        self.k_conv1d = ColumnParallelLinear(
+            input_size=self.conv_size,
+            output_size=projection_size,
+            bias=False,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.k_conv1d",
+        )
+        self.v_conv1d = ColumnParallelLinear(
+            input_size=self.conv_size,
+            output_size=projection_size,
+            bias=False,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.v_conv1d",
+        )
+
+        # 适配 conv 权重形状
+        self.q_conv1d.weight.data = self.q_conv1d.weight.data.unsqueeze(1)
+        self.k_conv1d.weight.data = self.k_conv1d.weight.data.unsqueeze(1)
+        self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
+
+        self.A_log = nn.Parameter(
+            torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
+        )
+        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
+
+        self.g_a_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.g_a_proj",
+        )
+        self.g_b_proj = ColumnParallelLinear(
+            self.head_dim,
+            projection_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.g_b_proj",
+        )
+
+        # 和 Kimi 一样，用 FusedRMSNormGated
+        self.o_norm = FusedRMSNormGated(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            activation="sigmoid",
+        )
+        self.o_proj = RowParallelLinear(
+            projection_size,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,     # [T, H]
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        q_proj_states = self.q_proj(hidden_states)[0]
+        k_proj_states = self.k_proj(hidden_states)[0]
+        v_proj_states = self.v_proj(hidden_states)[0]
+
+        q_conv_weights = self.q_conv1d.weight.view(
+            self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2)
+        )
+        k_conv_weights = self.k_conv1d.weight.view(
+            self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2)
+        )
+        v_conv_weights = self.v_conv1d.weight.view(
+            self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
+        )
+
+        kwargs = {
+            "q_proj_states": q_proj_states,
+            "k_proj_states": k_proj_states,
+            "v_proj_states": v_proj_states,
+            "q_conv_weights": q_conv_weights,
+            "k_conv_weights": k_conv_weights,
+            "v_conv_weights": v_conv_weights,
+            "q_conv_bias": self.q_conv1d.bias,
+            "k_conv_bias": self.k_conv1d.bias,
+            "v_conv_bias": self.v_conv1d.bias,
+            "dt_bias": self.dt_bias,
+            "b_proj": self.b_proj,
+            "f_a_proj": self.f_a_proj,
+            "f_b_proj": self.f_b_proj,
+            "A_log": self.A_log,
+            "head_dim": self.head_dim,
+            "hidden_states": hidden_states,
+            "layer_id": self.layer_idx,
+        }
+
+        core_attn_out = forward_batch.attn_backend.forward(
+            q=None,
+            k=None,
+            v=None,
+            layer=None,
+            forward_batch=forward_batch,
+            **kwargs,
+        )
+
+        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+        g = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
+        core_attn_out = self.o_norm(core_attn_out, g)
+        core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+
+        return self.o_proj(core_attn_out)[0]
+
+
 
 class Qwen3HybridLinearDecoderLayer(nn.Module):
 
@@ -460,9 +657,18 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.linear_attn = Qwen3GatedDeltaNet(
-            config, layer_id, quant_config, alt_stream
-        )
+        
+        if getattr(config, "model_type", "qwen3_next") == "qwen3_kimi":
+            self.linear_attn = Qwen3KimiDeltaAttention(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_attn", prefix),
+            )
+        else:
+            self.linear_attn = Qwen3GatedDeltaNet(
+                config, layer_id, quant_config, alt_stream
+            )
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -856,6 +1062,8 @@ class Qwen3NextForCausalLM(nn.Module):
         self.model = Qwen3NextModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        
+        self._debug_check_kimi_linear_weights()
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -875,6 +1083,29 @@ class Qwen3NextForCausalLM(nn.Module):
             }
         )
 
+    def _debug_check_kimi_linear_weights(self):
+        print("[SANITY] checking Kimi linear-attn weights for NaN/Inf...")
+        for i, layer in enumerate(self.model.layers):
+            if not isinstance(layer, Qwen3HybridLinearDecoderLayer):
+                continue
+            attn = layer.linear_attn
+            if not isinstance(attn, Qwen3KimiDeltaAttention):
+                continue
+
+            for name, mod in [
+                ("q_proj", attn.q_proj),
+                ("k_proj", attn.k_proj),
+                ("v_proj", attn.v_proj),
+            ]:
+                w = mod.weight.data
+                has_nan = torch.isnan(w).any().item()
+                has_inf = torch.isinf(w).any().item()
+                print(
+                    f"[SANITY] layer {i} {name}.weight: "
+                    f"nan={has_nan}, inf={has_inf}, "
+                    f"min={w.min().item():.4f}, max={w.max().item():.4f}"
+                )
+                
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
@@ -905,11 +1136,11 @@ class Qwen3NextForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
@@ -917,8 +1148,6 @@ class Qwen3NextForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -928,10 +1157,25 @@ class Qwen3NextForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-        for name, loaded_weight in weights:
+
+        # # ====== 1. 把模型自身参数写到一个文件 ======
+        # model_param_log = "debug_model_params.txt"
+        # with open(model_param_log, "w") as f:
+        #     for k, p in params_dict.items():
+        #         f.write(f"{k}\tshape={tuple(p.shape)}\n")
+        # print(f"[DEBUG] model param keys + shapes written to {model_param_log}")
+
+        # # ====== 2. 权重日志文件（在循环中逐条写） ======
+        # weights_log = "debug_loaded_weights.txt"
+        # fw = open(weights_log, "w")
+
+        for raw_name, loaded_weight in weights:
+            # 先记录原始名字和 shape
+            # fw.write(f"{raw_name}\tshape={tuple(loaded_weight.shape)}\n")
+
+            name = raw_name
 
             if is_mtp:
-
                 if "mtp" not in name:
                     continue
 
@@ -952,66 +1196,116 @@ class Qwen3NextForCausalLM(nn.Module):
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+                
+            # ========= 新加：linear_attn 直接跳过 stacked_params_mapping =========
+            use_stacked_mapping = ".linear_attn." not in name
+            # ================================================================
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                # TODO(fix mtp loading)
-                if "mlp.experts" in name:
-                    continue
-
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip layers on other devices.
-                # if is_pp_missing_parameter(name, self):
-                #     continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader")
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
+            if use_stacked_mapping:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip layers on other devices.
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
-                    # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-                    param = params_dict[name]
 
-                    weight_loader = getattr(param, "weight_loader")
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
+                    if "mlp.experts" in name:
+                        continue
+
+                    name = name.replace(weight_name, param_name)
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
+                    if name not in params_dict:
+                        # 这里也可以顺手记一下
+                        # fw.write(f"[WARN] stacked mapping: {name} not in params_dict (from {raw_name})\n")
+                        continue
 
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    weight_loader = getattr(param, "weight_loader")
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+                else:
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+
+                        if (
+                            name.endswith(".bias") or name.endswith("_bias")
+                        ) and name not in params_dict:
+                            continue
+                        if name not in params_dict:
+                            # fw.write(f"[WARN] expert mapping: {name} not in params_dict (from {raw_name})\n")
+                            continue
+
+                        param = params_dict[name]
+                        weight_loader = getattr(param, "weight_loader")
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        break
+                    else:
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if name not in params_dict:
+                            fw.write(f"[ERROR] fallback: {name} not in params_dict (from {raw_name})\n")
+                            continue
+
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        
+            else:
+                # ====== 这里是 linear_attn 的直接加载路径 ======
+                if name.endswith(".bias") and name not in params_dict:
+                    # 有些层可能没有 bias，直接跳过
+                    continue
+                if name not in params_dict:
+                    # fw.write(f"[ERROR] linear_attn direct: {name} not in params_dict (from {raw_name})\n")
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                # Qwen3-Kimi 的 linear_attn.q_proj/k_proj/v_proj 形状都和 ckpt 对齐，
+                # 这里不做 shard 拆分，直接 load 即可
+                weight_loader(param, loaded_weight)
+
+                loaded_params.add(name)
+
+        # fw.close()
+        
+        # print(f"[DEBUG] loaded weights keys + shapes written to {weights_log}")
+
+        # ====== Post-load sanity check for Kimi linear attention ======
+        try:
+            from sglang.srt.models.qwen3_next import Qwen3KimiDeltaAttention
+        except Exception:
+            Qwen3KimiDeltaAttention = None
+
+        if Qwen3KimiDeltaAttention is not None:
+            print("[SANITY] post-load Kimi linear-attn weights:")
+            for name, module in self.model.named_modules():
+                if isinstance(module, Qwen3KimiDeltaAttention):
+                    layer_id = module.layer_idx
+                    for proj_name, proj in [
+                        ("q_proj", module.q_proj),
+                        ("k_proj", module.k_proj),
+                        ("v_proj", module.v_proj),
+                    ]:
+                        w = proj.weight.data
+                        nan = torch.isnan(w).any().item()
+                        inf = torch.isinf(w).any().item()
+                        w_safe = torch.nan_to_num(w.float())
+                        print(
+                            f"  layer {layer_id} {name}.{proj_name}.weight:"
+                            f" nan={nan}, inf={inf}, "
+                            f"min={w_safe.min().item():.4f}, max={w_safe.max().item():.4f}"
+                        )
+        # print(f"[DEBUG] loaded weights keys + shapes written to {weights_log}")
         return loaded_params
 
     @classmethod

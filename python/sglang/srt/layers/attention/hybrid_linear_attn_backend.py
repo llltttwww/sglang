@@ -71,6 +71,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self._debug_counter = 0  # 控制打印次数
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -331,16 +332,51 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
+        
+        import os
+
+        def maybe_attach_debugpy(tag: str = ""):
+            """在需要的地方调用这个函数，就可以让当前进程等待 VSCode attach。"""
+            # if os.getenv("SGLANG_DEBUGPY", "0") != "1":
+            #     return
+
+            try:
+                import debugpy
+            except ImportError:
+                print("[DEBUGPY] debugpy not installed, skip attach")
+                return
+
+            if not debugpy.is_client_connected():
+                # 这里可以改端口，但 5678 是默认习惯
+                debugpy.listen(("0.0.0.0", 5678))
+                print(f"[DEBUGPY] Waiting for debugger attach on 5678... ({tag})")
+                debugpy.wait_for_client()
+                print("[DEBUGPY] Debugger attached.")
+
+            # 在这一行相当于打了一个断点
+            debugpy.breakpoint()
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
+        conv_states = layer_cache.conv  # [pool_size, 3 * proj_size, state_len]
+
+        # 本地 projection_size= q_proj_states 的最后一维
+        proj_size = q_proj_states.shape[-1]
+
+        # 安全起见加个断言（炸了至少知道是哪儿不对）
+        assert conv_states.shape[1] == 3 * proj_size, (
+            f"Unexpected conv dim: {conv_states.shape} vs proj_size={proj_size}"
+        )
+
+        # 按 dim=1 切成 q/k/v 三块，每块 [pool_size, proj_size, state_len]
+        q_conv_state, k_conv_state, v_conv_state = conv_states.split(proj_size, dim=1)
+
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        q_conv_state = q_conv_state.transpose(-1, -2)
-        k_conv_state = k_conv_state.transpose(-1, -2)
-        v_conv_state = v_conv_state.transpose(-1, -2)
+        # q_conv_state = q_conv_state.transpose(-1, -2)
+        # k_conv_state = k_conv_state.transpose(-1, -2)
+        # v_conv_state = v_conv_state.transpose(-1, -2)
 
         q = causal_conv1d_update(
             q_proj_states,
@@ -394,6 +430,44 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             cu_seqlens=query_start_loc,
         )
         ssm_states[cache_indices] = last_recurrent_state
+        
+        # def debug_check(name: str, x: torch.Tensor):
+        #     if self._debug_counter >= 5:
+        #         return
+        #     with torch.no_grad():
+        #         if not torch.isfinite(x).all():
+        #             print(f"[DEBUG] {name} has NaN/Inf at layer {layer_id}")
+        #             print("  any_nan:", torch.isnan(x).any().item())
+        #             print("  any_inf:", torch.isinf(x).any().item())
+        #             # 只在第一次直接炸，方便看到 call stack
+        #             raise RuntimeError(f"{name} contains NaN/Inf")
+        #         else:
+        #             print(
+        #                 f"[DEBUG] {name} OK at layer {layer_id}, "
+        #                 f"mean={x.mean().item():.4f}, std={x.std().item():.4f}"
+        #             )
+
+        # # 只重点看出问题的第 4 层，不然日志太多
+        # if layer_id == 4:
+        #     debug_check("hidden_states", hidden_states)
+        #     debug_check("q_proj_states", q_proj_states)
+        #     debug_check("k_proj_states", k_proj_states)
+        #     debug_check("v_proj_states", v_proj_states)
+        
+        # # === decode 数值监控 ===
+        # with torch.no_grad():
+        #     if not torch.isfinite(core_attn_out).all():
+        #         print(f"[DEBUG] core_attn_out (decode) has NaN/Inf! layer_id={layer_id}")
+        #         print("  any_nan:", torch.isnan(core_attn_out).any().item())
+        #         print("  any_inf:", torch.isinf(core_attn_out).any().item())
+        #         # 这里直接 raise 方便看到第一层 / 第一次炸的地方
+        #         raise RuntimeError("core_attn_out decode contains NaN/Inf")
+        #     else:
+        #         # 如果太吵可以先注释掉
+        #         print(f"[DEBUG] core_attn_out (decode) OK layer_id={layer_id}, "
+        #               f"mean={core_attn_out.mean().item():.4f}, "
+        #               f"std={core_attn_out.std().item():.4f}")
+
         return core_attn_out
 
     def forward_extend(
@@ -434,11 +508,23 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_state_q, conv_state_k, conv_state_v = mamba_cache_params.conv
-        # deal with strides
-        conv_state_q = conv_state_q.transpose(-1, -2)
-        conv_state_k = conv_state_k.transpose(-1, -2)
-        conv_state_v = conv_state_v.transpose(-1, -2)
+        conv_states_all = mamba_cache_params.conv  # [pool_size, 3 * proj_size, state_len]
+
+        # 注意：这里的 q_proj_states 还没 transpose，shape 是 [T, proj_size]
+        proj_size = q_proj_states.shape[-1]
+        assert conv_states_all.shape[1] == 3 * proj_size
+
+        # if layer_id == 0:  # 只在第一层打一行日志
+        #     print("[DEBUG] conv_states_all.shape:", conv_states_all.shape)
+        #     print("[DEBUG] q_proj_states.shape:", q_proj_states.shape)
+
+        conv_state_q, conv_state_k, conv_state_v = conv_states_all.split(
+            proj_size, dim=1
+        )
+        # # deal with strides
+        # conv_state_q = conv_state_q.transpose(-1, -2)
+        # conv_state_k = conv_state_k.transpose(-1, -2)
+        # conv_state_v = conv_state_v.transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
 
@@ -512,6 +598,18 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             cu_seqlens=query_start_loc,
         )
         ssm_states[cache_indices] = last_recurrent_state
+        
+        # # === extend 数值监控 ===
+        # with torch.no_grad():
+        #     if not torch.isfinite(core_attn_out).all():
+        #         print(f"[DEBUG] core_attn_out (extend) has NaN/Inf! layer_id={layer_id}")
+        #         print("  any_nan:", torch.isnan(core_attn_out).any().item())
+        #         print("  any_inf:", torch.isinf(core_attn_out).any().item())
+        #         raise RuntimeError("core_attn_out extend contains NaN/Inf")
+        #     else:
+        #         print(f"[DEBUG] core_attn_out (extend) OK layer_id={layer_id}, "
+        #               f"mean={core_attn_out.mean().item():.4f}, "
+        #               f"std={core_attn_out.std().item():.4f}")
 
         return core_attn_out
 

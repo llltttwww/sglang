@@ -245,6 +245,12 @@ class Qwen3NextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
+        
+        full_interval = getattr(self, "full_attention_interval", None)
+        linear_interval = getattr(self, "linear_attention_interval", None)
+
+        if full_interval is None and linear_interval is not None:
+            self.full_attention_interval = linear_interval
 
     @property
     def layers_block_type(self):
@@ -289,3 +295,18 @@ class Qwen3NextConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+class Qwen3KimiConfig(Qwen3NextConfig):
+    # 关键：改 model_type
+    model_type = "qwen3_kimi"
+
+    def __init__(self, **kwargs):
+        # 直接复用 Qwen3NextConfig 的所有字段
+        super().__init__(**kwargs)
+        
+        full_interval = getattr(self, "full_attention_interval", None)
+        linear_interval = getattr(self, "linear_attention_interval", None)
+
+        if full_interval is None and linear_interval is not None:
+            self.full_attention_interval = linear_interval

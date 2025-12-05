@@ -36,6 +36,41 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+# # === 修复开始：注册自定义 Config 和 Tokenizer ===
+# import sys
+# from transformers import AutoConfig, AutoTokenizer, Qwen2Config, Qwen3NextConfig
+
+# # 尝试导入 Qwen2 的 Tokenizer，如果版本太旧可能需要 fallback
+
+# from transformers import Qwen2Tokenizer, Qwen2TokenizerFast
+
+# class Qwen3KimiConfig(Qwen3NextConfig):
+#     model_type = "qwen3_kimi"
+
+#     def __init__(self, linear_attention_interval=4, **kwargs):
+#         # 1. 如果 config.json 里已经有 linear_attention_interval，就优先用那个
+#         if "linear_attention_interval" in kwargs:
+#             linear_attention_interval = kwargs.pop("linear_attention_interval")
+
+#         # 2. Qwen3NextConfig 在 __init__ 里是从 kwargs["full_attention_interval"] 里取模式
+#         #    我们用自己的 linear_attention_interval 填进去
+#         if "full_attention_interval" not in kwargs:
+#             kwargs["full_attention_interval"] = linear_attention_interval
+
+#         # 3. 其它字段（hidden_size / moe_intermediate_size / num_experts...）
+#         #    全部来自 config.json，在 kwargs 里已经有了，直接交给父类就行
+#         super().__init__(**kwargs)
+# # 1. 注册 Config
+
+# AutoConfig.register("qwen3_kimi", Qwen3KimiConfig)
+# print("[Slime] Successfully registered 'qwen3_kimi' config.")
+
+
+# AutoTokenizer.register(Qwen3KimiConfig, slow_tokenizer_class=Qwen2Tokenizer, fast_tokenizer_class=Qwen2TokenizerFast)
+# print("[Slime] Successfully registered 'qwen3_kimi' tokenizer mapping.")
+# # === 修复结束 ===
+
+
 from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
@@ -52,6 +87,7 @@ from sglang.srt.configs import (
     NemotronHConfig,
     Olmo3Config,
     Qwen3NextConfig,
+    Qwen3KimiConfig,
     Step3VLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -59,6 +95,8 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+
+from sglang.srt.configs import Step3TextConfig,Qwen3NextConfig
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -73,6 +111,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     Olmo3Config,
     KimiLinearConfig,
     Qwen3NextConfig,
+    Qwen3KimiConfig,
     FalconH1Config,
     DotsVLMConfig,
     DotsOCRConfig,

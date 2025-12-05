@@ -35,6 +35,7 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     NemotronHConfig,
     Qwen3NextConfig,
+    Qwen3KimiConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -86,6 +87,10 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -155,6 +160,7 @@ from sglang.srt.utils.offloader import (
     set_offloader,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -484,6 +490,10 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+
+        # Init routed experts capturer
+        self.init_routed_experts_capturer()
+
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
@@ -518,6 +528,31 @@ class ModelRunner:
                 eagle_aux_hidden_state_layer_ids = None
 
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+
+    def init_routed_experts_capturer(self):
+        # TODO: the redundant logic with TpModelWorker
+        max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if self.server_args.max_running_requests is None
+                else self.server_args.max_running_requests
+                // (
+                    self.server_args.dp_size
+                    if self.server_args.enable_dp_attention
+                    else 1
+                )
+            ),
+            self.req_to_token_pool.size,
+        )
+        set_global_experts_capturer(
+            RoutedExpertsCapturer.create(
+                enable=get_global_server_args().enable_return_routed_experts,
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=max_running_requests,
+                device=self.device,
+            )
+        )
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -758,7 +793,11 @@ class ModelRunner:
 
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=self.server_args.enable_weights_cpu_backup,
+            enable_cpu_backup=(
+                self.server_args.enable_weights_cpu_backup
+                if not self.is_draft_worker
+                else True
+            ),
         ):
             self.model = get_model(
                 model_config=self.model_config,
@@ -1385,7 +1424,7 @@ class ModelRunner:
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig | JetNemotronConfig):
+        if isinstance(config, Qwen3NextConfig | JetNemotronConfig) and not isinstance(config, Qwen3KimiConfig):
             return config
         return None
 
@@ -1399,7 +1438,7 @@ class ModelRunner:
     @property
     def kimi_linear_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, KimiLinearConfig):
+        if isinstance(config, KimiLinearConfig | Qwen3KimiConfig):
             return config
         return None
 
@@ -1810,6 +1849,7 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
                     **extra_args,
                 )
@@ -2163,6 +2203,10 @@ class ModelRunner:
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+            )
+            # Copy cached routing experts' buffers back to CPU cache
+            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+                forward_batch.out_cache_loc
             )
 
         if self.eplb_manager is not None:
