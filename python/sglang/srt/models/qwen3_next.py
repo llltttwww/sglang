@@ -1250,7 +1250,7 @@ class Qwen3NextForCausalLM(nn.Module):
                         if name.endswith(".bias") and name not in params_dict:
                             continue
                         if name not in params_dict:
-                            fw.write(f"[ERROR] fallback: {name} not in params_dict (from {raw_name})\n")
+                            # fw.write(f"[ERROR] fallback: {name} not in params_dict (from {raw_name})\n")
                             continue
 
                         param = params_dict[name]
