@@ -1,3 +1,7 @@
+[INFO] Found safetensors files: ['model-00000-of-00001.safetensors']
+[INFO] Loading /mnt/shared-storage-user/p1-shared/luotianwei/pretrain/posttrain/slime/hf_checkpoints/qwen3-kimi-1204-iter0000173/model-00000-of-00001.safetensors ...
+[INFO] #ckpt params: 3366
+============================================================
 model.layers.0.input_layernorm.weight                                             (1024,)
 model.layers.0.linear_attn.A_log                                                  (1, 1, 16, 1)
 model.layers.0.linear_attn.b_proj.weight                                          (16, 1024)
