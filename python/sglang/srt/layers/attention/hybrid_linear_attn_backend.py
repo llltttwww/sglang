@@ -57,6 +57,18 @@ elif is_npu():
     causal_conv1d_update = causal_conv1d_update_npu
 
 
+def _in_cuda_graph_capture() -> bool:
+    try:
+        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    except Exception:
+        # 某些版本没有这个 API，保守一点：当成不在 capture
+        return False
+
+def _dbg_print(*args, **kwargs):
+    if _in_cuda_graph_capture():
+        return
+    print(*args, **kwargs)
+
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -276,7 +288,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
         if forward_mode.is_target_verify() and spec_info.topk > 1:
             bs_without_pad = spec_info.retrive_next_token.shape[0]
-            # print(spec_info.retrive_next_token, spec_info.retrive_next_sibling)
+            # _dbg_print(spec_info.retrive_next_token, spec_info.retrive_next_sibling)
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
                 spec_info.retrive_next_token
             )
@@ -343,15 +355,15 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             try:
                 import debugpy
             except ImportError:
-                print("[DEBUGPY] debugpy not installed, skip attach")
+                _dbg_print("[DEBUGPY] debugpy not installed, skip attach")
                 return
 
             if not debugpy.is_client_connected():
                 # 这里可以改端口，但 5678 是默认习惯
                 debugpy.listen(("0.0.0.0", 5678))
-                print(f"[DEBUGPY] Waiting for debugger attach on 5678... ({tag})")
+                _dbg_print(f"[DEBUGPY] Waiting for debugger attach on 5678... ({tag})")
                 debugpy.wait_for_client()
-                print("[DEBUGPY] Debugger attached.")
+                _dbg_print("[DEBUGPY] Debugger attached.")
 
             # 在这一行相当于打了一个断点
             debugpy.breakpoint()
@@ -436,13 +448,13 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         #         return
         #     with torch.no_grad():
         #         if not torch.isfinite(x).all():
-        #             print(f"[DEBUG] {name} has NaN/Inf at layer {layer_id}")
-        #             print("  any_nan:", torch.isnan(x).any().item())
-        #             print("  any_inf:", torch.isinf(x).any().item())
+        #             _dbg_print(f"[DEBUG] {name} has NaN/Inf at layer {layer_id}")
+        #             _dbg_print("  any_nan:", torch.isnan(x).any().item())
+        #             _dbg_print("  any_inf:", torch.isinf(x).any().item())
         #             # 只在第一次直接炸，方便看到 call stack
         #             raise RuntimeError(f"{name} contains NaN/Inf")
         #         else:
-        #             print(
+        #             _dbg_print(
         #                 f"[DEBUG] {name} OK at layer {layer_id}, "
         #                 f"mean={x.mean().item():.4f}, std={x.std().item():.4f}"
         #             )
@@ -457,14 +469,14 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         # # === decode 数值监控 ===
         # with torch.no_grad():
         #     if not torch.isfinite(core_attn_out).all():
-        #         print(f"[DEBUG] core_attn_out (decode) has NaN/Inf! layer_id={layer_id}")
-        #         print("  any_nan:", torch.isnan(core_attn_out).any().item())
-        #         print("  any_inf:", torch.isinf(core_attn_out).any().item())
+        #         _dbg_print(f"[DEBUG] core_attn_out (decode) has NaN/Inf! layer_id={layer_id}")
+        #         _dbg_print("  any_nan:", torch.isnan(core_attn_out).any().item())
+        #         _dbg_print("  any_inf:", torch.isinf(core_attn_out).any().item())
         #         # 这里直接 raise 方便看到第一层 / 第一次炸的地方
         #         raise RuntimeError("core_attn_out decode contains NaN/Inf")
         #     else:
         #         # 如果太吵可以先注释掉
-        #         print(f"[DEBUG] core_attn_out (decode) OK layer_id={layer_id}, "
+        #         _dbg_print(f"[DEBUG] core_attn_out (decode) OK layer_id={layer_id}, "
         #               f"mean={core_attn_out.mean().item():.4f}, "
         #               f"std={core_attn_out.std().item():.4f}")
 
@@ -480,9 +492,12 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-            causal_conv1d_fn,
-        )
+        """
+        普通 extend/prefill：沿用 causal_conv1d_fn + chunk_kda（快速）
+        EAGLE verify(target_verify)：逐 step 跑 causal_conv1d_update + fused_recurrent_kda，
+        并把每一步的 SSM/conv 状态写入 intermediate buffers，供 update_mamba_state_after_mtp_verify scatter。
+        """
+        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import causal_conv1d_fn
 
         q_proj_states = kwargs["q_proj_states"]
         k_proj_states = kwargs["k_proj_states"]
@@ -504,89 +519,385 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
 
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        
+        # _dbg_print(f'@@@is_target_verify: {is_target_verify}')
+
         query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
+        cache_indices_all = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states_all = mamba_cache_params.conv  # [pool_size, 3 * proj_size, state_len]
-
-        # 注意：这里的 q_proj_states 还没 transpose，shape 是 [T, proj_size]
-        proj_size = q_proj_states.shape[-1]
-        assert conv_states_all.shape[1] == 3 * proj_size
-
-        # if layer_id == 0:  # 只在第一层打一行日志
-        #     print("[DEBUG] conv_states_all.shape:", conv_states_all.shape)
-        #     print("[DEBUG] q_proj_states.shape:", q_proj_states.shape)
-
-        conv_state_q, conv_state_k, conv_state_v = conv_states_all.split(
-            proj_size, dim=1
-        )
-        # # deal with strides
-        # conv_state_q = conv_state_q.transpose(-1, -2)
-        # conv_state_k = conv_state_k.transpose(-1, -2)
-        # conv_state_v = conv_state_v.transpose(-1, -2)
-
+        conv_states_all = mamba_cache_params.conv  # [pool_size, 3*proj, state_len]
         ssm_states = mamba_cache_params.temporal
 
-        has_initial_state = forward_batch.extend_prefix_lens > 0
+        proj_size = q_proj_states.shape[-1]
+        if conv_states_all.shape[1] != 3 * proj_size:
+            raise RuntimeError(
+                f"[KimiLinearAttnBackend] Unexpected conv dim: conv_states_all.shape={tuple(conv_states_all.shape)} "
+                f"vs proj_size={proj_size} (expected conv_states_all.shape[1]==3*proj_size)"
+            )
 
-        q_proj_states = q_proj_states.transpose(0, 1)
-        k_proj_states = k_proj_states.transpose(0, 1)
-        v_proj_states = v_proj_states.transpose(0, 1)
+        # -----------------------------
+        # helpers: write intermediate buffers with flexible shapes
+        # -----------------------------
+        def _store_intermediate_ssm(
+            inter_ssm: torch.Tensor,
+            layer_id_: int,
+            pool_indices: torch.Tensor,  # [bs]
+            step_t: int,
+            state_tensor: torch.Tensor,  # [bs, ...] (structured or flat)
+        ):
+            """
+            inter_ssm supported shapes:
+            - [pool, steps, state_dim]                         (3D)
+            - [layers, pool, steps, state_dim]                 (4D)
+            - [pool, steps, ...state_shape...]                 (5D+)
+            - [layers, pool, steps, ...state_shape...]         (6D+)
+            """
+            dim = inter_ssm.dim()
+            st = state_tensor
+
+            if dim == 3:
+                # [pool, steps, state_dim]
+                target = inter_ssm[pool_indices, step_t, :]  # [bs, state_dim]
+                if st.dim() != 2:
+                    st = st.reshape(st.shape[0], -1)
+                if target.shape != st.shape:
+                    raise RuntimeError(
+                        f"[KimiLinearAttnBackend] intermediate_ssm (3D) shape mismatch: "
+                        f"target={tuple(target.shape)} vs state={tuple(st.shape)}"
+                    )
+                target.copy_(st)
+
+            elif dim == 4:
+                # [layers, pool, steps, state_dim]
+                target = inter_ssm[layer_id_, pool_indices, step_t, :]  # [bs, state_dim]
+                if st.dim() != 2:
+                    st = st.reshape(st.shape[0], -1)
+                if target.shape != st.shape:
+                    raise RuntimeError(
+                        f"[KimiLinearAttnBackend] intermediate_ssm (4D) shape mismatch: "
+                        f"target={tuple(target.shape)} vs state={tuple(st.shape)}"
+                    )
+                target.copy_(st)
+
+            elif dim == 5:
+                # [pool, steps, ...state_shape...]
+                target = inter_ssm[pool_indices, step_t]  # [bs, ...]
+                if target.shape != st.shape:
+                    # allow flatten->reshape if inter expects flat and state is structured (unlikely in 5D)
+                    if target.dim() == 2 and st.dim() > 2:
+                        st2 = st.reshape(st.shape[0], -1)
+                        if target.shape != st2.shape:
+                            raise RuntimeError(
+                                f"[KimiLinearAttnBackend] intermediate_ssm (5D) shape mismatch: "
+                                f"target={tuple(target.shape)} vs state={tuple(st.shape)}"
+                            )
+                        target.copy_(st2)
+                    else:
+                        raise RuntimeError(
+                            f"[KimiLinearAttnBackend] intermediate_ssm (5D) shape mismatch: "
+                            f"target={tuple(target.shape)} vs state={tuple(st.shape)}"
+                        )
+                else:
+                    target.copy_(st)
+
+            elif dim == 6:
+                # [layers, pool, steps, ...state_shape...]
+                target = inter_ssm[layer_id_, pool_indices, step_t]  # [bs, ...]
+                if target.shape != st.shape:
+                    if target.dim() == 2 and st.dim() > 2:
+                        st2 = st.reshape(st.shape[0], -1)
+                        if target.shape != st2.shape:
+                            raise RuntimeError(
+                                f"[KimiLinearAttnBackend] intermediate_ssm (6D) shape mismatch: "
+                                f"target={tuple(target.shape)} vs state={tuple(st.shape)}"
+                            )
+                        target.copy_(st2)
+                    else:
+                        raise RuntimeError(
+                            f"[KimiLinearAttnBackend] intermediate_ssm (6D) shape mismatch: "
+                            f"target={tuple(target.shape)} vs state={tuple(st.shape)}"
+                        )
+                else:
+                    target.copy_(st)
+
+            else:
+                raise RuntimeError(
+                    f"[KimiLinearAttnBackend] intermediate_ssm has unsupported dim={dim}, shape={tuple(inter_ssm.shape)}. "
+                    "Expected 3/4/5/6D."
+                )
+
+        def _store_intermediate_conv(
+            inter_conv: torch.Tensor,
+            layer_id_: int,
+            pool_indices: torch.Tensor,   # [bs]
+            step_t: int,
+            conv_cat: torch.Tensor,       # [bs, 3*proj, state_len]
+        ):
+            """
+            inter_conv supported shapes:
+            - [pool, steps, 3*proj, state_len]                 (4D)
+            - [layers, pool, steps, 3*proj, state_len]         (5D)
+            """
+            dim = inter_conv.dim()
+            if dim == 4:
+                target = inter_conv[pool_indices, step_t, :, :]  # [bs, 3*proj, state_len]
+                if target.shape != conv_cat.shape:
+                    raise RuntimeError(
+                        f"[KimiLinearAttnBackend] intermediate_conv_window (4D) shape mismatch: "
+                        f"target={tuple(target.shape)} vs conv={tuple(conv_cat.shape)}"
+                    )
+                target.copy_(conv_cat)
+            elif dim == 5:
+                target = inter_conv[layer_id_, pool_indices, step_t, :, :]
+                if target.shape != conv_cat.shape:
+                    raise RuntimeError(
+                        f"[KimiLinearAttnBackend] intermediate_conv_window (5D) shape mismatch: "
+                        f"target={tuple(target.shape)} vs conv={tuple(conv_cat.shape)}"
+                    )
+                target.copy_(conv_cat)
+            else:
+                raise RuntimeError(
+                    f"[KimiLinearAttnBackend] intermediate_conv_window has unsupported dim={dim}, "
+                    f"shape={tuple(inter_conv.shape)}. Expected 4D or 5D."
+                )
+
+        # -------------------------------------------------------------------------
+        # EAGLE verify (target_verify) 分支
+        # -------------------------------------------------------------------------
+        if is_target_verify:
+            if forward_batch.spec_info is None:
+                raise RuntimeError("[KimiLinearAttnBackend] target_verify=True but forward_batch.spec_info is None")
+
+            if getattr(forward_batch.spec_info, "topk", 1) != 1:
+                raise RuntimeError(
+                    "[KimiLinearAttnBackend] This implementation currently supports --speculative-eagle-topk=1 only. "
+                    "For topk>1 you must add retrieve_next_token/retrieve_next_sibling/retrieve_parent_token handling."
+                )
+
+            if not isinstance(mamba_cache_params, MambaPool.SpeculativeState):
+                raise RuntimeError(
+                    "[KimiLinearAttnBackend] target_verify=True requires MambaPool.SpeculativeState cache, "
+                    f"but got {type(mamba_cache_params)}."
+                )
+
+            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
+            
+
+
+
+            draft_token_num = int(forward_batch.spec_info.draft_token_num)
+            seq_len = int(q_proj_states.shape[0])
+
+            if seq_len % draft_token_num != 0:
+                raise RuntimeError(
+                    f"[KimiLinearAttnBackend] target_verify expects seq_len divisible by draft_token_num, "
+                    f"but got seq_len={seq_len}, draft_token_num={draft_token_num}"
+                )
+
+            bs = seq_len // draft_token_num
+            cache_indices = cache_indices_all[:bs].contiguous()
+            
+            import os
+            if os.getenv("SGLANG_VERIFY_DEBUG", "1") == "1" and (not _in_cuda_graph_capture()):
+                if layer_id == 0:
+                    _dbg_print("\n=== [Kimi target_verify] buffers ===")
+                    _dbg_print("draft_token_num:", int(forward_batch.spec_info.draft_token_num))
+                    _dbg_print("bs:", int(bs), "seq_len:", int(q_proj_states.shape[0]))
+                    _dbg_print("cache_indices[:8]:", cache_indices[:8].tolist())
+                    _dbg_print("intermediate_state_cache.shape:", tuple(intermediate_state_cache.shape),
+                        "dim:", intermediate_state_cache.dim(), "dtype:", intermediate_state_cache.dtype)
+                    _dbg_print("intermediate_conv_window_cache.shape:", tuple(intermediate_conv_window_cache.shape),
+                        "dim:", intermediate_conv_window_cache.dim(), "dtype:", intermediate_conv_window_cache.dtype)
+                    _dbg_print("=== [Kimi target_verify] end ===\n")
+
+            conv_state_q, conv_state_k, conv_state_v = conv_states_all.split(proj_size, dim=1)
+
+            # verify: 临时滚动状态，避免直接污染主 cache
+            conv_q = conv_state_q.clone()
+            conv_k = conv_state_k.clone()
+            conv_v = conv_state_v.clone()
+            state = ssm_states[cache_indices].contiguous()
+
+            # reshape tokens: [bs, steps, proj]
+            q_ps = q_proj_states.view(bs, draft_token_num, proj_size).contiguous()
+            k_ps = k_proj_states.view(bs, draft_token_num, proj_size).contiguous()
+            v_ps = v_proj_states.view(bs, draft_token_num, proj_size).contiguous()
+
+            # gating from hidden_states
+            beta_full = b_proj(hidden_states)[0].float().sigmoid()          # [seq_len, ...]
+            raw_g_full = f_b_proj(f_a_proj(hidden_states)[0])[0]            # [seq_len, ...]
+            g_full = fused_kda_gate(raw_g_full, A_log, head_dim, g_bias=dt_bias)  # [seq_len, ...]
+
+            beta_full = beta_full.view(bs, draft_token_num, -1).contiguous()
+            g_full = g_full.view(bs, draft_token_num, -1).contiguous()
+
+            cu = torch.arange(0, bs + 1, dtype=torch.int32, device=q_proj_states.device)
+
+            outs = []
+
+            for t in range(draft_token_num):
+                q_t = causal_conv1d_update(
+                    q_ps[:, t, :],
+                    conv_q,
+                    q_conv_weights,
+                    q_conv_bias,
+                    activation="silu",
+                    conv_state_indices=cache_indices,
+                )
+                k_t = causal_conv1d_update(
+                    k_ps[:, t, :],
+                    conv_k,
+                    k_conv_weights,
+                    k_conv_bias,
+                    activation="silu",
+                    conv_state_indices=cache_indices,
+                )
+                v_t = causal_conv1d_update(
+                    v_ps[:, t, :],
+                    conv_v,
+                    v_conv_weights,
+                    v_conv_bias,
+                    activation="silu",
+                    conv_state_indices=cache_indices,
+                )
+
+                q_t, k_t, v_t = map(
+                    lambda x: rearrange(x, "b (h d) -> 1 b h d", d=head_dim),
+                    (q_t, k_t, v_t),
+                )
+
+                beta_t = beta_full[:, t, :].unsqueeze(0)
+                g_t = g_full[:, t, :].unsqueeze(0)
+
+                out_t, state = fused_recurrent_kda(
+                    q=q_t,
+                    k=k_t,
+                    v=v_t,
+                    g=g_t,
+                    beta=beta_t,
+                    initial_state=state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu,
+                )
+                outs.append(out_t)
+
+                # ---- store intermediate states ----
+                state_to_store = state.to(intermediate_state_cache.dtype, copy=False)
+                _store_intermediate_ssm(
+                    intermediate_state_cache,
+                    layer_id,
+                    cache_indices,
+                    t,
+                    state_to_store,
+                )
+
+                conv_cat = torch.cat(
+                    [conv_q[cache_indices], conv_k[cache_indices], conv_v[cache_indices]],
+                    dim=1,
+                ).to(intermediate_conv_window_cache.dtype, copy=False)  # [bs, 3*proj, state_len]
+                _store_intermediate_conv(
+                    intermediate_conv_window_cache,
+                    layer_id,
+                    cache_indices,
+                    t,
+                    conv_cat,
+                )
+                
+                import os
+                if os.getenv("SGLANG_VERIFY_DEBUG", "1") == "1" and (not _in_cuda_graph_capture()):
+                    if layer_id == 0 and t < 2:
+                        with torch.no_grad():
+                            _dbg_print(f"[Kimi verify] t={t} state mean/std:",
+                                float(state.float().mean().item()),
+                                float(state.float().std().item()))
+                            # 读回你刚写的 intermediate（用最保守的方式：只打印 shape，不硬编码维度）
+                            try:
+                                # 尝试按 “layers,pool,step,...” 读一条
+                                if intermediate_state_cache.dim() == 5:
+                                    # [pool, steps, ...]
+                                    x = intermediate_state_cache[cache_indices[0], t]
+                                elif intermediate_state_cache.dim() == 6:
+                                    # [layers, pool, steps, ...]
+                                    x = intermediate_state_cache[layer_id, cache_indices[0], t]
+                                else:
+                                    x = intermediate_state_cache[cache_indices[0], t]
+                                _dbg_print(f"[Kimi verify] inter_ssm readback t={t} shape:", tuple(x.shape),
+                                    "mean/std:", float(x.float().mean().item()), float(x.float().std().item()))
+                            except Exception as e:
+                                _dbg_print("[Kimi verify] readback inter_ssm failed:", repr(e))
+
+
+            outs_stacked = torch.stack([o.squeeze(0) for o in outs], dim=1)  # [bs, steps, h, d]
+            core_attn_out = outs_stacked.reshape(
+                1, bs * draft_token_num, outs_stacked.shape[2], outs_stacked.shape[3]
+            ).contiguous()
+
+            return core_attn_out
+
+        # -------------------------------------------------------------------------
+        # 非 verify：走 fast extend 路径（你原来的逻辑）
+        # -------------------------------------------------------------------------
+        conv_state_q, conv_state_k, conv_state_v = conv_states_all.split(proj_size, dim=1)
+
+        has_initial_state = (forward_batch.extend_prefix_lens is not None) and (forward_batch.extend_prefix_lens > 0)
+
+        q_proj_states_t = q_proj_states.transpose(0, 1)
+        k_proj_states_t = k_proj_states.transpose(0, 1)
+        v_proj_states_t = v_proj_states.transpose(0, 1)
 
         q = causal_conv1d_fn(
-            q_proj_states,
+            q_proj_states_t,
             q_conv_weights,
             q_conv_bias,
             activation="silu",
             conv_states=conv_state_q,
             has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
+            cache_indices=cache_indices_all,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
         k = causal_conv1d_fn(
-            k_proj_states,
+            k_proj_states_t,
             k_conv_weights,
             k_conv_bias,
             activation="silu",
             conv_states=conv_state_k,
             has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
+            cache_indices=cache_indices_all,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
         v = causal_conv1d_fn(
-            v_proj_states,
+            v_proj_states_t,
             v_conv_weights,
             v_conv_bias,
             activation="silu",
             conv_states=conv_state_v,
             has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
+            cache_indices=cache_indices_all,
             query_start_loc=query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
         q, k, v = map(
-            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
+            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim),
+            (q, k, v),
         )
 
         beta = b_proj(hidden_states)[0].float().sigmoid()
-
         g = f_b_proj(f_a_proj(hidden_states)[0])[0]
         g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
 
         beta = beta.unsqueeze(0)
         g = g.unsqueeze(0)
 
-        initial_state = ssm_states[cache_indices].contiguous()
-        (
-            core_attn_out,
-            last_recurrent_state,
-        ) = chunk_kda(
+        initial_state = ssm_states[cache_indices_all].contiguous()
+        core_attn_out, last_recurrent_state = chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -597,21 +908,12 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
         )
-        ssm_states[cache_indices] = last_recurrent_state
-        
-        # # === extend 数值监控 ===
-        # with torch.no_grad():
-        #     if not torch.isfinite(core_attn_out).all():
-        #         print(f"[DEBUG] core_attn_out (extend) has NaN/Inf! layer_id={layer_id}")
-        #         print("  any_nan:", torch.isnan(core_attn_out).any().item())
-        #         print("  any_inf:", torch.isinf(core_attn_out).any().item())
-        #         raise RuntimeError("core_attn_out extend contains NaN/Inf")
-        #     else:
-        #         print(f"[DEBUG] core_attn_out (extend) OK layer_id={layer_id}, "
-        #               f"mean={core_attn_out.mean().item():.4f}, "
-        #               f"std={core_attn_out.std().item():.4f}")
+        ssm_states[cache_indices_all] = last_recurrent_state
 
         return core_attn_out
+
+
+
 
 
 class GDNAttnBackend(MambaAttnBackendBase):
@@ -1092,3 +1394,29 @@ class HybridLinearAttnBackend(AttentionBackend):
         conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
             :, valid_state_indices, last_steps
         ].to(conv_states.dtype, copy=False)
+        
+        import os
+
+        if os.getenv("SGLANG_VERIFY_DEBUG", "1") == "1" and (not _in_cuda_graph_capture()):
+            _dbg_print("\n=== [update_mamba_state_after_mtp_verify] ===")
+            _dbg_print("accepted_indices:", accepted_indices.tolist())
+            _dbg_print("state_indices_tensor[:min]:", state_indices_tensor[:min(8, state_indices_tensor.numel())].tolist())
+
+            _dbg_print("ssm_states.shape:", tuple(ssm_states.shape))
+            _dbg_print("intermediate_state_cache.shape:", tuple(intermediate_state_cache.shape))
+            _dbg_print("conv_states.shape:", tuple(conv_states.shape))
+            _dbg_print("intermediate_conv_window_cache.shape:", tuple(intermediate_conv_window_cache.shape))
+
+            _dbg_print("valid N:", int(valid_mask.sum().item()))
+            if valid_mask.any():
+                _dbg_print("valid_state_indices min/max:",
+                    int(valid_state_indices.min().item()), int(valid_state_indices.max().item()))
+                _dbg_print("last_steps min/max:",
+                    int(last_steps.min().item()), int(last_steps.max().item()))
+
+                # 关键：检查你假设的 step 维度到底是不是 dim=2
+                if intermediate_state_cache.dim() >= 3:
+                    step_dim = intermediate_state_cache.shape[2]  # 你现在代码就是按这个在用
+                    _dbg_print("intermediate_state_cache step_dim(shape[2]):", int(step_dim))
+                    _dbg_print("OOB(last_steps >= step_dim):", bool((last_steps >= step_dim).any().item()))
+            _dbg_print("=== [update_mamba_state_after_mtp_verify] end ===\n")

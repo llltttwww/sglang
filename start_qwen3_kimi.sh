@@ -14,7 +14,8 @@ python -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000 \
   --dtype bfloat16 \
-  # --speculative-algorithm EAGLE \
-  # --speculative-draft-model-path /mnt/shared-storage-user/p1-shared/luotianwei/pretrain/posttrain/slime/hf_checkpoints/qwen3-kimi-1204-iter0000173 \
-  # --speculative-num-steps 3 \
-  # --speculative-eagle-topk 1 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.75 

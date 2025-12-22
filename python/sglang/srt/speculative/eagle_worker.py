@@ -708,7 +708,8 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if self.target_worker.model_runner.hybrid_gdn_config is not None:
+        # if self.target_worker.model_runner.hybrid_gdn_config is not None:
+        if True:
             accepted_length = (
                 torch.tensor(
                     res.accept_length_per_req_cpu,
@@ -745,6 +746,27 @@ class EAGLEWorker(TpModelWorker):
                 )
             else:
                 max_relative_indices_per_req = accepted_length - 1
+            
+            import os
+            if os.getenv("SGLANG_VERIFY_DEBUG", "1") == "1":
+                print("\n=== [EAGLE verify] accept debug ===")
+                print("draft_token_num:", int(spec_info.draft_token_num), "topk:", int(spec_info.topk))
+                print("accept_length_per_req_cpu:", res.accept_length_per_req_cpu)  # python list
+                print("accepted_length(+1):", accepted_length.tolist())
+                print("max_relative_indices_per_req:", max_relative_indices_per_req.tolist())
+                print("max_relative min/max:", int(max_relative_indices_per_req.min().item()),
+                    int(max_relative_indices_per_req.max().item()))
+                # 关键：检查是否越界（>= draft_token_num）
+                oob = (max_relative_indices_per_req >= int(spec_info.draft_token_num)).any().item()
+                print("OOB (max_relative >= draft_token_num):", bool(oob))
+
+                # 再看一下 accepted_indices 的结构（前几十个足够）
+                ai = res.accepted_indices
+                print("accepted_indices.shape:", tuple(ai.shape))
+                print("accepted_indices[:32]:", ai[:32].tolist())
+                print("verified_id.shape:", tuple(res.verified_id.shape))
+                print("=== [EAGLE verify] end ===\n")                
+
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
                 max_relative_indices_per_req, self.target_worker.model_runner.model
             )
