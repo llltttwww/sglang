@@ -246,6 +246,8 @@ class Qwen3NextConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
         
+        self.layer_types=layer_types
+        
         full_interval = getattr(self, "full_attention_interval", None)
         linear_interval = getattr(self, "linear_attention_interval", None)
 
@@ -255,6 +257,17 @@ class Qwen3NextConfig(PretrainedConfig):
     @property
     def layers_block_type(self):
         layer_type_list = []
+        
+        if self.layer_types is not None:
+            for l in range(self.num_hidden_layers):
+                if self.layer_types[l]=='full_attention':
+                    layer_type_list.append(HybridLayerType.full_attention.value)
+                elif self.layer_types[l]=='linear_attention':
+                    layer_type_list.append(HybridLayerType.linear_attention.value)
+                else:
+                    raise NotImplementedError(f'Unsupported layer type: {self.layer_types[l]}')
+            return layer_type_list
+
 
         for l in range(self.num_hidden_layers):
             if (l + 1) % self.full_attention_interval == 0:
