@@ -1447,13 +1447,17 @@ def _execute_server_warmup(
     url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
+    # Warmup traffic should never go through user/system HTTP proxies; it is always
+    # a local self-check against our own listener.
+    session = requests.Session()
+    session.trust_env = False
 
     # Wait until the server is launched
     success = False
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = session.get(url + "/get_model_info", timeout=5, headers=headers)
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -1533,7 +1537,7 @@ def _execute_server_warmup(
 
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
+            res = session.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
@@ -1559,7 +1563,7 @@ def _execute_server_warmup(
                 ],
                 "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
             }
-            res = requests.post(
+            res = session.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,

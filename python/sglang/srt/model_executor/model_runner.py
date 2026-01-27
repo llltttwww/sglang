@@ -1369,6 +1369,20 @@ class ModelRunner:
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
+        # For "all-linear" (no full-attention layers), KV cache cell_size becomes 0.
+        # In this case we still need a non-zero token capacity for request bookkeeping
+        # (req_to_token mapping, radix cache indices, etc.), but it should not be
+        # computed from KV cache bytes-per-token.
+        if cell_size == 0:
+            # Each token index is int64 (8B) in radix cache / alloc outputs.
+            # Cap it to avoid allocating an unreasonably large free-page tensor.
+            index_cell_size = torch._utils._element_size(torch.int64)
+            max_by_mem = int(max(rest_memory, 0) * (1 << 30) // index_cell_size)
+            # Empirically aligned with the default heuristic (context_len * 512 requests).
+            soft_cap = max(self.model_config.context_len, self.model_config.context_len * 512)
+            # Always keep enough "token slots" for at least one full-context request.
+            return max(self.model_config.context_len, min(max_by_mem, soft_cap))
+
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
@@ -1598,6 +1612,73 @@ class ModelRunner:
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        
+        # # --- ADD THIS BLOCK ---
+        # if self.max_total_num_tokens == 0:
+        #     log_info_on_rank0(
+        #         logger,
+        #         "KV cache is disabled (all-linear-attention). Skip KV pool allocation."
+        #     )
+
+        #     # 仍然要初始化 req_to_token_pool（很多路径依赖它）
+        #     # 但 token_to_kv_pool / allocator 用一个“空实现/占位实现”
+        #     extra_max_context_len = 4
+        #     if self.server_args.speculative_num_draft_tokens is not None:
+        #         extra_max_context_len += self.server_args.speculative_num_draft_tokens
+
+        #     if self.server_args.disaggregation_mode == "decode":
+        #         from sglang.srt.disaggregation.decode import (
+        #             DecodeReqToTokenPool,
+        #             HybridMambaDecodeReqToTokenPool,
+        #         )
+
+        #         # subscribe memory for pre-allocated requests
+        #         # if max_num_reqs <= 32, we pre-allocate 2x requests
+        #         pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+        #         if config := self.mambaish_config:
+        #             self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
+        #                 size=max_num_reqs,
+        #                 max_context_len=self.model_config.context_len
+        #                 + extra_max_context_len,
+        #                 device=self.device,
+        #                 enable_memory_saver=self.server_args.enable_memory_saver,
+        #                 cache_params=config.mamba2_cache_params,
+        #                 speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+        #                 pre_alloc_size=pre_alloc_size,
+        #             )
+        #         else:
+        #             self.req_to_token_pool = DecodeReqToTokenPool(
+        #                 size=max_num_reqs,
+        #                 max_context_len=self.model_config.context_len
+        #                 + extra_max_context_len,
+        #                 device=self.device,
+        #                 enable_memory_saver=self.server_args.enable_memory_saver,
+        #                 pre_alloc_size=pre_alloc_size,
+        #             )
+        #     elif config := self.mambaish_config:
+        #         self.req_to_token_pool = HybridReqToTokenPool(
+        #             size=max_num_reqs,
+        #             mamba_size=self.server_args.max_mamba_cache_size,
+        #             max_context_len=self.model_config.context_len
+        #             + extra_max_context_len,
+        #             device=self.device,
+        #             enable_memory_saver=self.server_args.enable_memory_saver,
+        #             cache_params=config.mamba2_cache_params,
+        #             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+        #         )
+        #     else:
+        #         self.req_to_token_pool = ReqToTokenPool(
+        #             size=max_num_reqs,
+        #             max_context_len=self.model_config.context_len
+        #             + extra_max_context_len,
+        #             device=self.device,
+        #             enable_memory_saver=self.server_args.enable_memory_saver,
+        #         )
+
+        #     self.token_to_kv_pool = None
+        #     self.token_to_kv_pool_allocator = None
+        #     return        
+
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
 
@@ -1673,7 +1754,7 @@ class ModelRunner:
         if self.is_hybrid:
             self.set_num_token_hybrid()
 
-        if self.max_total_num_tokens <= 0:
+        if self.max_total_num_tokens < 0:
             raise RuntimeError(
                 f"Not enough memory. Please try to increase --mem-fraction-static. "
                 f"Current value: {self.server_args.mem_fraction_static=}"
@@ -1844,7 +1925,9 @@ class ModelRunner:
                     head_dim=self.model_config.head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
                     full_attention_layer_ids=(
-                        [0] if self.is_draft_worker else config.full_attention_layer_ids
+                        [config.full_attention_layer_ids[0]]
+                        if (self.is_draft_worker and config.full_attention_layer_ids)
+                        else config.full_attention_layer_ids
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,

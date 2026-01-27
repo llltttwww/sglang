@@ -47,6 +47,10 @@ class SamplingBatchInfo:
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
     acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
+    # Repetition penalty cannot be represented as an additive bias; in overlap mode we
+    # pass a compact state snapshot to the model worker and apply it on logits there.
+    repetition_penalties: Optional[torch.Tensor] = None  # [B, 1]
+    repetition_seen_tokens: Optional[torch.Tensor] = None  # [B, V] bool
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -152,6 +156,7 @@ class SamplingBatchInfo:
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
                 penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedRepetitionPenalizer,
             },
         )
 
@@ -206,7 +211,23 @@ class SamplingBatchInfo:
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
 
     def update_penalties(self):
-        if self.penalizer_orchestrator.is_required:
+        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+            # Only allocate the [B, V] additive buffer when at least one additive
+            # penalizer is active. (Repetition penalty is multiplicative and cannot
+            # be baked into acc_linear_penalties.)
+            need_linear = False
+            for cls_ in (
+                penaltylib.BatchedFrequencyPenalizer,
+                penaltylib.BatchedPresencePenalizer,
+                penaltylib.BatchedMinNewTokensPenalizer,
+            ):
+                pen = self.penalizer_orchestrator.penalizers.get(cls_)
+                if pen is not None and pen.is_prepared():
+                    need_linear = True
+                    break
+            if not need_linear:
+                self.acc_linear_penalties = None
+                return
             self.acc_linear_penalties = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
@@ -224,6 +245,14 @@ class SamplingBatchInfo:
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
+        elif self.repetition_penalties is not None and self.repetition_seen_tokens is not None:
+            # Overlap mode: apply HuggingFace-style repetition penalty.
+            penalty = self.repetition_penalties.to(dtype=logits.dtype)
+            inv_penalty = (1.0 / self.repetition_penalties).to(dtype=logits.dtype)
+            neg = logits < 0
+            mask = self.repetition_seen_tokens
+            logits.mul_(torch.where(mask & neg, penalty, 1.0))
+            logits.mul_(torch.where(mask & (~neg), inv_penalty, 1.0))
 
         if self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
@@ -361,9 +390,25 @@ class SamplingBatchInfo:
         self.need_min_p_sampling |= other.need_min_p_sampling
 
     def copy_for_forward(self):
-        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
+        # Accumulate additive penalties into a pre-allocated buffer to get rid of
+        # the dependency of `penalizer_orchestrator` later.
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        repetition_penalties = None
+        repetition_seen_tokens = None
+        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+            rp = self.penalizer_orchestrator.penalizers.get(
+                penaltylib.BatchedRepetitionPenalizer
+            )
+            if rp is not None and rp.is_prepared():
+                repetition_penalties = rp.repetition_penalties
+                repetition_seen_tokens = rp.seen_tokens
+
+        return dataclasses.replace(
+            self,
+            penalizer_orchestrator=None,
+            repetition_penalties=repetition_penalties,
+            repetition_seen_tokens=repetition_seen_tokens,
+        )
 
 
 def merge_bias_tensor(

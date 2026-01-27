@@ -332,43 +332,22 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
-        
-        import os
 
-        def maybe_attach_debugpy(tag: str = ""):
-            """在需要的地方调用这个函数，就可以让当前进程等待 VSCode attach。"""
-            # if os.getenv("SGLANG_DEBUGPY", "0") != "1":
-            #     return
-
-            try:
-                import debugpy
-            except ImportError:
-                print("[DEBUGPY] debugpy not installed, skip attach")
-                return
-
-            if not debugpy.is_client_connected():
-                # 这里可以改端口，但 5678 是默认习惯
-                debugpy.listen(("0.0.0.0", 5678))
-                print(f"[DEBUGPY] Waiting for debugger attach on 5678... ({tag})")
-                debugpy.wait_for_client()
-                print("[DEBUGPY] Debugger attached.")
-
-            # 在这一行相当于打了一个断点
-            debugpy.breakpoint()
+        # For Qwen3-Kimi all-linear checkpoints we must match the HF remote-code
+        # implementation which uses fla-core ops (ShortConvolution + kda kernels).
+        import fla.modules.convolution as fla_conv
+        from fla.ops.kda import fused_recurrent_kda as fla_fused_recurrent_kda
+        from fla.ops.kda.gate import fused_kda_gate as fla_fused_kda_gate
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = layer_cache.conv  # [pool_size, 3 * proj_size, state_len]
+        conv_states = layer_cache.conv
 
-        # 本地 projection_size= q_proj_states 的最后一维
-        proj_size = q_proj_states.shape[-1]
-
-        # 安全起见加个断言（炸了至少知道是哪儿不对）
-        assert conv_states.shape[1] == 3 * proj_size, (
-            f"Unexpected conv dim: {conv_states.shape} vs proj_size={proj_size}"
+        # KDA cache stores q/k/v conv states as a list of 3 tensors:
+        #   [pool_size, D, W] (W == kernel_size)
+        assert isinstance(conv_states, list) and len(conv_states) == 3, (
+            f"Unexpected KDA conv state container: {type(conv_states)=}, {getattr(conv_states, '__len__', lambda: None)()=}"
         )
-
-        # 按 dim=1 切成 q/k/v 三块，每块 [pool_size, proj_size, state_len]
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(proj_size, dim=1)
+        q_conv_state, k_conv_state, v_conv_state = conv_states
 
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -378,58 +357,87 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         # k_conv_state = k_conv_state.transpose(-1, -2)
         # v_conv_state = v_conv_state.transpose(-1, -2)
 
-        q = causal_conv1d_update(
-            q_proj_states,
-            q_conv_state,
-            q_conv_weights,
-            q_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-        k = causal_conv1d_update(
-            k_proj_states,
-            k_conv_state,
-            k_conv_weights,
-            k_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-        v = causal_conv1d_update(
-            v_proj_states,
-            v_conv_state,
-            v_conv_weights,
-            v_conv_bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
+        # fla causal_conv1d_update doesn't support an indices indirection, so we
+        # gather per-request caches, update them, then scatter back.
+        cache_indices_i64 = cache_indices.to(torch.int64)
+        valid_mask = cache_indices_i64 >= 0
+        # MambaPool allocates cache lines in [0, size), and leaves an extra
+        # all-zero line at the end (size). Use it as the padding slot.
+        pad_idx = q_conv_state.shape[0] - 1
+        safe_idx = torch.where(
+            valid_mask, cache_indices_i64, torch.full_like(cache_indices_i64, pad_idx)
         )
 
+        def _decode_conv(x_2d: torch.Tensor, cache_full: torch.Tensor, w: torch.Tensor, b: torch.Tensor):
+            # NOTE: Avoid fla's causal_conv1d_update here. We observed correctness
+            # regressions under CUDA graph replay for Qwen3-Kimi all-linear (KDA),
+            # likely due to the update kernel's internal state/workspace behavior.
+            # Using causal_conv1d(backend="triton") with q_len=1 keeps it graph-safe
+            # while remaining functionally equivalent.
+            #
+            # x_2d: [N, D] -> [1, N, D] (varlen via cu_seqlens=query_start_loc)
+            cache_sel = cache_full.index_select(0, safe_idx).contiguous()
+            y, cache_sel = fla_conv.causal_conv1d(
+                x=x_2d.unsqueeze(0),
+                weight=w,
+                bias=b,
+                residual=None,
+                initial_state=cache_sel,
+                output_final_state=True,
+                activation="silu",
+                backend="triton",
+                cu_seqlens=query_start_loc,
+            )
+            # Scatter updated caches back. This is CUDA-graph friendly:
+            # no data-dependent control flow or dynamic-shape indexing.
+            cache_full.index_copy_(0, safe_idx, cache_sel)
+
+            y = y.squeeze(0)
+            # Zero-out padded rows without boolean indexing.
+            y = y * valid_mask.to(dtype=y.dtype).unsqueeze(-1)
+            return y
+
+        q = _decode_conv(q_proj_states, q_conv_state, q_conv_weights, q_conv_bias)
+        k = _decode_conv(k_proj_states, k_conv_state, k_conv_weights, k_conv_bias)
+        v = _decode_conv(v_proj_states, v_conv_state, v_conv_weights, v_conv_bias)
+
+        # SGLang uses packed (varlen) decoding: B=1, T=sum(seq_lens)=bs, with cu_seqlens.
         q, k, v = map(
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
         )
 
-        beta = b_proj(hidden_states)[0].float().sigmoid()
+        beta = b_proj(hidden_states)[0].float().sigmoid()  # [N, H]
 
         g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
+        g = fla_fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)  # [N, H, D]
 
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
+        beta = beta.unsqueeze(0)  # [1, N, H]
+        g = g.unsqueeze(0)  # [1, N, H, D]
 
-        initial_state = ssm_states[cache_indices].contiguous()
+        pad_state_idx = ssm_states.shape[0] - 1
+        safe_state_idx = torch.where(
+            valid_mask,
+            cache_indices_i64,
+            torch.full_like(cache_indices_i64, pad_state_idx),
+        )
+        initial_state = ssm_states.index_select(0, safe_state_idx).contiguous()
         (
             core_attn_out,
             last_recurrent_state,
-        ) = fused_recurrent_kda(
+        ) = fla_fused_recurrent_kda(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
             initial_state=initial_state,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
         )
-        ssm_states[cache_indices] = last_recurrent_state
+        ssm_states.index_copy_(
+            0, safe_state_idx, last_recurrent_state.to(ssm_states.dtype, copy=False)
+        )
         
         # def debug_check(name: str, x: torch.Tensor):
         #     if self._debug_counter >= 5:
@@ -480,9 +488,11 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-            causal_conv1d_fn,
-        )
+        # Match HF remote-code implementation (fla-core).
+        import fla.modules.convolution as fla_conv
+        from fla.ops.kda import chunk_kda as fla_chunk_kda
+        from fla.ops.kda import fused_recurrent_kda as fla_fused_recurrent_kda
+        from fla.ops.kda.gate import fused_kda_gate as fla_fused_kda_gate
 
         q_proj_states = kwargs["q_proj_states"]
         k_proj_states = kwargs["k_proj_states"]
@@ -508,19 +518,11 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states_all = mamba_cache_params.conv  # [pool_size, 3 * proj_size, state_len]
-
-        # 注意：这里的 q_proj_states 还没 transpose，shape 是 [T, proj_size]
-        proj_size = q_proj_states.shape[-1]
-        assert conv_states_all.shape[1] == 3 * proj_size
-
-        # if layer_id == 0:  # 只在第一层打一行日志
-        #     print("[DEBUG] conv_states_all.shape:", conv_states_all.shape)
-        #     print("[DEBUG] q_proj_states.shape:", q_proj_states.shape)
-
-        conv_state_q, conv_state_k, conv_state_v = conv_states_all.split(
-            proj_size, dim=1
+        conv_states_all = mamba_cache_params.conv
+        assert isinstance(conv_states_all, list) and len(conv_states_all) == 3, (
+            f"Unexpected KDA conv state container: {type(conv_states_all)=}, {getattr(conv_states_all, '__len__', lambda: None)()=}"
         )
+        conv_state_q, conv_state_k, conv_state_v = conv_states_all
         # # deal with strides
         # conv_state_q = conv_state_q.transpose(-1, -2)
         # conv_state_k = conv_state_k.transpose(-1, -2)
@@ -528,47 +530,36 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
 
         ssm_states = mamba_cache_params.temporal
 
-        has_initial_state = forward_batch.extend_prefix_lens > 0
+        cache_indices_i64 = cache_indices.to(torch.int64)
+        valid_mask = cache_indices_i64 >= 0
+        pad_idx = conv_state_q.shape[0] - 1
+        safe_idx = torch.where(
+            valid_mask, cache_indices_i64, torch.full_like(cache_indices_i64, pad_idx)
+        )
 
-        q_proj_states = q_proj_states.transpose(0, 1)
-        k_proj_states = k_proj_states.transpose(0, 1)
-        v_proj_states = v_proj_states.transpose(0, 1)
+        def _extend_conv(x_2d: torch.Tensor, cache_full: torch.Tensor, w: torch.Tensor, b: torch.Tensor):
+            # x_2d: [T, D] -> [1, T, D] for varlen mode (cu_seqlens)
+            x = x_2d.unsqueeze(0)
+            init = cache_full.index_select(0, safe_idx).contiguous()
+            y, final_state = fla_conv.causal_conv1d(
+                x=x,
+                weight=w,
+                bias=b,
+                residual=None,
+                initial_state=init,
+                output_final_state=True,
+                activation="silu",
+                backend="triton",
+                cu_seqlens=query_start_loc,
+            )
+            # Scatter back (CUDA-graph friendly).
+            cache_full.index_copy_(0, safe_idx, final_state)
+            # y: [1, T, D] -> [T, D]
+            return y.squeeze(0)
 
-        q = causal_conv1d_fn(
-            q_proj_states,
-            q_conv_weights,
-            q_conv_bias,
-            activation="silu",
-            conv_states=conv_state_q,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-
-        k = causal_conv1d_fn(
-            k_proj_states,
-            k_conv_weights,
-            k_conv_bias,
-            activation="silu",
-            conv_states=conv_state_k,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-
-        v = causal_conv1d_fn(
-            v_proj_states,
-            v_conv_weights,
-            v_conv_bias,
-            activation="silu",
-            conv_states=conv_state_v,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        q = _extend_conv(q_proj_states, conv_state_q, q_conv_weights, q_conv_bias)
+        k = _extend_conv(k_proj_states, conv_state_k, k_conv_weights, k_conv_bias)
+        v = _extend_conv(v_proj_states, conv_state_v, v_conv_weights, v_conv_bias)
 
         q, k, v = map(
             lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
@@ -577,27 +568,52 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         beta = b_proj(hidden_states)[0].float().sigmoid()
 
         g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
+        g = fla_fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
 
         beta = beta.unsqueeze(0)
         g = g.unsqueeze(0)
 
-        initial_state = ssm_states[cache_indices].contiguous()
-        (
-            core_attn_out,
-            last_recurrent_state,
-        ) = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=query_start_loc,
+        pad_state_idx = ssm_states.shape[0] - 1
+        safe_state_idx = torch.where(
+            valid_mask,
+            cache_indices_i64,
+            torch.full_like(cache_indices_i64, pad_state_idx),
         )
-        ssm_states[cache_indices] = last_recurrent_state
+        initial_state = ssm_states.index_select(0, safe_state_idx).contiguous()
+        # HF reference uses fused_recurrent_kda for short prefill (q_len <= 64),
+        # and chunk_kda for longer sequences.
+        seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if isinstance(seq_lens_cpu, list):
+            max_q_len = max(seq_lens_cpu) if seq_lens_cpu else 0
+        else:
+            max_q_len = int(seq_lens_cpu.max().item())
+        if max_q_len <= 64:
+            core_attn_out, last_recurrent_state = fla_fused_recurrent_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+            )
+        else:
+            core_attn_out, last_recurrent_state = fla_chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+            )
+        ssm_states.index_copy_(
+            0, safe_state_idx, last_recurrent_state.to(ssm_states.dtype, copy=False)
+        )
         
         # # === extend 数值监控 ===
         # with torch.no_grad():

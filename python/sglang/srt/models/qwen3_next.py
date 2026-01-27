@@ -11,7 +11,7 @@ from sglang.srt.distributed import divide, get_pp_group, get_tensor_model_parall
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated
+from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated as SglFusedRMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -55,6 +55,12 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+try:
+    # Prefer fla-core implementation to match HF remote-code (Qwen3-Kimi).
+    from fla.modules import FusedRMSNormGated as FlaFusedRMSNormGated  # type: ignore
+except Exception:
+    FlaFusedRMSNormGated = None
 
 import triton
 import triton.language as tl
@@ -461,6 +467,7 @@ class Qwen3KimiDeltaAttention(nn.Module):
         super().__init__()
         # 用 attention tp，而不是 get_tensor_model_parallel_world_size
         self.tp_size = get_attention_tp_size()
+        self.tp_rank = get_attention_tp_rank()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_id
         self.config = config
@@ -482,6 +489,8 @@ class Qwen3KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.q_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.k_proj = ColumnParallelLinear(
             self.hidden_size,
@@ -489,6 +498,8 @@ class Qwen3KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.k_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.v_proj = ColumnParallelLinear(
             self.hidden_size,
@@ -496,6 +507,8 @@ class Qwen3KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.v_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         self.f_a_proj = ReplicatedLinear(
@@ -512,6 +525,8 @@ class Qwen3KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         self.dt_bias = nn.Parameter(
@@ -525,28 +540,36 @@ class Qwen3KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.b_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         self.q_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
             output_size=projection_size,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=f"{prefix}.q_conv1d",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.k_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
             output_size=projection_size,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=f"{prefix}.k_conv1d",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
         self.v_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
             output_size=projection_size,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=f"{prefix}.v_conv1d",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         # 适配 conv 权重形状
@@ -572,10 +595,13 @@ class Qwen3KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.g_b_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
         # 和 Kimi 一样，用 FusedRMSNormGated
-        self.o_norm = FusedRMSNormGated(
+        norm_cls = FlaFusedRMSNormGated or SglFusedRMSNormGated
+        self.o_norm = norm_cls(
             self.head_dim,
             eps=config.rms_norm_eps,
             activation="sigmoid",
@@ -586,6 +612,8 @@ class Qwen3KimiDeltaAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
         )
 
     def forward(
@@ -1072,7 +1100,9 @@ class Qwen3NextForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
-        self.lm_head = self.lm_head.float()
+        # Keep bf16 lm_head for qwen3_kimi to match HF reference behavior.
+        if getattr(config, "model_type", None) != "qwen3_kimi":
+            self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)
 
         self._routed_experts_weights_of_layer = LazyValue(

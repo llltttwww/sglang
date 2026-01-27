@@ -149,15 +149,15 @@ class KimiLinearStateShape:
         proj_size = num_heads * head_dim
         proj_k_size = num_k_heads * head_k_dim
 
-        conv_state_shape = (divide(proj_size, tp_world_size), conv_kernel_size - 1)
-        conv_state_k_shape = (divide(proj_k_size, tp_world_size), conv_kernel_size - 1)
+        # NOTE: KDA's ShortConvolution cache keeps a window of length `kernel_size`,
+        # shape [N, D, W]. (It shifts-left and appends the new token each step.)
+        conv_state_shape = (divide(proj_size, tp_world_size), conv_kernel_size)
+        conv_state_k_shape = (divide(proj_k_size, tp_world_size), conv_kernel_size)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
 
-        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
-        conv_state_k_shape = conv_state_k_shape[1], conv_state_k_shape[0]
-
         return KimiLinearStateShape(
-            conv=[conv_state_shape, conv_state_k_shape, conv_state_k_shape],
+            # Cache order follows (q, k, v) for KDA.
+            conv=[conv_state_shape, conv_state_k_shape, conv_state_shape],
             temporal=temporal_state_shape,
             num_heads=num_heads,
             head_dim=head_dim,

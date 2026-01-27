@@ -392,7 +392,9 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid = self.tp_worker.is_hybrid
-        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
+        # "Mamba-ish" models (e.g. hybrid GDN / Kimi linear) use a hybrid cache that
+        # needs MambaRadixCache for correct mamba state eviction and prefix reuse.
+        self.is_hybrid_gdn = self.tp_worker.model_runner.mambaish_config is not None
 
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size

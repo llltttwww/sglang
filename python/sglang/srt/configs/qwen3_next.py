@@ -323,3 +323,22 @@ class Qwen3KimiConfig(Qwen3NextConfig):
 
         if full_interval is None and linear_interval is not None:
             self.full_attention_interval = linear_interval
+
+    @property
+    def mamba2_cache_params(self):
+        """Cache layout for KimiDeltaAttention (KDA).
+
+        KDA uses three short-conv states (q/k/v) with a different memory layout from
+        standard Mamba2. Use KimiLinearCacheParams so HybridReqToTokenPool/MambaPool
+        allocates the correct state tensors.
+        """
+        from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        shape = KimiLinearStateShape.create(
+            tp_world_size=get_attention_tp_size(),
+            num_heads=self.linear_num_value_heads,
+            head_dim=self.linear_value_head_dim,
+            conv_kernel_size=self.linear_conv_kernel_dim,
+        )
+        return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
