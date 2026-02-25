@@ -206,6 +206,8 @@ class Qwen3NextConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         mlp_only_layers=[],
         layer_types=None,
+        num_zero_experts = 0,
+        zero_experts_type = None,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -253,6 +255,10 @@ class Qwen3NextConfig(PretrainedConfig):
 
         if full_interval is None and linear_interval is not None:
             self.full_attention_interval = linear_interval
+        
+        # ZCE arguments
+        self.num_zero_experts = num_zero_experts
+        self.zero_experts_type = zero_experts_type
 
     @property
     def layers_block_type(self):

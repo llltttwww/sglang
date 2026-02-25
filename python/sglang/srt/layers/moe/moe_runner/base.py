@@ -28,6 +28,7 @@ class MoeRunnerConfig:
     # MoE parameters
     num_experts: Optional[int] = None
     num_local_experts: Optional[int] = None
+    num_zero_experts: Optional[int] = None
     hidden_size: Optional[int] = None
     intermediate_size_per_partition: Optional[int] = None
     layer_id: Optional[int] = None

@@ -7,7 +7,7 @@ from torch import nn
 from einops import rearrange
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
-from sglang.srt.distributed import divide, get_pp_group, get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import divide, get_pp_group, get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce, get_moe_expert_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -27,6 +27,10 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.ep_moe.kernels import zero_experts_compute_triton
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -198,6 +202,167 @@ def fused_qkvzba_split_reshape_cat(
     )
     return mixed_qkv, z, b, a
 
+class Qwen3NextZCESparseMoeBlock(Qwen2MoeSparseMoeBlock):
+    def __init__(
+        self,
+        layer_id: int,
+        config: Qwen3NextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        prefix: str = "",
+    ):
+        nn.Module.__init__(self)
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.layer_id = layer_id
+        self.alt_stream = alt_stream
+        if self.tp_size > config.num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.num_experts}."
+            )
+
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=config.norm_topk_prob,
+            layer_id=layer_id,
+        )
+
+        self.experts = get_moe_impl_class(quant_config)(
+            layer_id=self.layer_id,
+            top_k=config.num_experts_per_tok,
+            num_experts=config.num_experts
+            + get_global_server_args().ep_num_redundant_experts,
+            num_zero_experts=config.num_zero_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
+        )
+
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts + getattr(config, "num_zero_experts", 0),
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("gate", prefix),
+        )
+        if config.shared_expert_intermediate_size > 0:
+            self.shared_expert = Qwen2MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.shared_expert_intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=add_prefix("shared_expert", prefix),
+                **(
+                    dict(tp_rank=0, tp_size=1)
+                    if get_moe_a2a_backend().is_deepep()
+                    else {}
+                ),
+            )
+        else:
+            self.shared_expert = None
+        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
+        self.zero_experts_type = config.zero_experts_type
+        self.num_zero_experts = config.num_zero_experts
+        self.num_experts = config.num_experts
+        
+        if get_moe_a2a_backend().is_deepep():
+            # TODO: we will support tp < ep in the future
+            self.ep_size = get_moe_expert_parallel_world_size()
+            self.num_experts = (
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
+            )
+            self.top_k = config.num_experts_per_tok
+
+    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        raise NotImplementedError("Qwen3NextPlusPlusSparseMoeBlock does not support deepep")
+
+    def _handle_zce(self, topk_output, hidden_states):
+        """Handle ZCE: mask out ZCE indices and compute ZCE contributions."""
+        topk_weights, topk_ids, router_logits = topk_output
+        zce_output = None
+        zce_type = self.zero_experts_type
+        if zce_type == "zero":
+            zce_mask = topk_ids >= self.num_experts
+            topk_weights[zce_mask] = 0.0
+            topk_ids[zce_mask] = -1
+        elif zce_type == "copy":
+            zce_output = zero_experts_compute_triton(
+                    expert_indices=topk_ids,
+                    expert_scales=topk_weights,
+                    num_experts=self.num_experts,
+                    zero_expert_type=zce_type,
+                    hidden_states=hidden_states,
+                )
+        else:
+            raise ValueError(f"Invalid ZCE type: {zce_type}")
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits), zce_output
+
+    def _forward_router_experts(self, hidden_states: torch.Tensor):
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        zce_output = None
+        # Handle ZCE
+        if self.zero_experts_type is not None:
+            topk_output, zce_output = self._handle_zce(
+                topk_output, hidden_states
+            )
+        return self.experts(hidden_states, topk_output), zce_output
+
+    def forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(hidden_states.clone())
+
+        with torch.cuda.stream(self.alt_stream):
+            router_output, zce_output = self._forward_router_experts(hidden_states)
+
+        current_stream.wait_stream(self.alt_stream)
+
+        return router_output, shared_output, zce_output
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if get_moe_a2a_backend().is_deepep():
+            return self._forward_deepep(hidden_states, forward_batch)
+
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        if (
+            self.alt_stream is not None
+            and hidden_states.shape[0] > 0
+            and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and get_is_capture_mode()
+        ):
+            final_hidden_states, shared_output, zce_output = self.forward_normal_dual_stream(
+                hidden_states
+            )
+        else:
+            shared_output = self._forward_shared_experts(hidden_states)
+            final_hidden_states, zce_output = self._forward_router_experts(hidden_states)
+
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        if self.tp_size > 1 and not use_reduce_scatter:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        # Add ZCE contributions
+        if zce_output and hidden_states.shape[0] > 0:
+            final_hidden_states += zce_output.to(final_hidden_states.device)
+        
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
@@ -711,7 +876,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.mlp = Qwen3NextZCESparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -865,7 +1030,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.mlp = Qwen3NextZCESparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -1109,7 +1274,7 @@ class Qwen3NextForCausalLM(nn.Module):
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                if isinstance(layer.mlp, Qwen3NextZCESparseMoeBlock)
             }
         )
 

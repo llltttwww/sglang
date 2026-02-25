@@ -144,6 +144,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_clamp_limit: Optional[float] = None,
         use_weight_loader_fused: bool = False,
         with_bias=False,
+        num_zero_experts: Optional[int] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -153,6 +154,7 @@ class FusedMoE(torch.nn.Module):
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
+        self.num_zero_experts = num_zero_experts
         self.num_fused_shared_experts = num_fused_shared_experts
 
         enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
@@ -190,6 +192,7 @@ class FusedMoE(torch.nn.Module):
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
+            num_zero_experts=self.num_zero_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             layer_id=layer_id,

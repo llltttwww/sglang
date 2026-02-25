@@ -276,6 +276,7 @@ def fused_experts(
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
+        or moe_runner_config.num_zero_experts is not None and moe_runner_config.num_zero_experts > 0
     )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
