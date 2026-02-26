@@ -280,7 +280,25 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
-            self.hf_config.num_nextn_predict_layers = 1
+            draft_layers = getattr(self.hf_config, "mtp_num_layers", None)
+            if draft_layers is None:
+                draft_layers = getattr(self.hf_config, "num_nextn_predict_layers", None)
+            if draft_layers is None:
+                draft_layers = 1
+
+            # For MTP draft models, `num_nextn_predict_layers` determines the number
+            # of layers that will be used as the draft stack.
+            self.hf_config.num_nextn_predict_layers = int(draft_layers)
+
+            # Ensure downstream components (layer scatter modes, hybrid-linear KV pool,
+            # etc.) see a consistent single-stack config for the draft model.
+            self.hf_config.num_hidden_layers = int(draft_layers)
+
+            # Qwen3 MTP layers are transformer (full-attention) layers. Force the
+            # draft stack to be full-attention-only even if the target model is
+            # hybrid (linear + full).
+            self.hf_config.layer_types = ["full_attention"] * int(draft_layers)
+            self.hf_config.full_attention_interval = 1
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model

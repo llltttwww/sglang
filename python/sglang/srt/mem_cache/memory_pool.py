@@ -128,12 +128,12 @@ class MambaPool:
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
-            if isinstance(self.conv, list):
-                return type(self)(
-                    conv=[v[layer] for v in self.conv],
-                    temporal=self.temporal[layer],
-                )
-            return type(self)(**{k: v[layer] for k, v in vars(self).items()})
+            def _slice(v):
+                if isinstance(v, list):
+                    return [x[layer] for x in v]
+                return v[layer]
+
+            return type(self)(**{k: _slice(v) for k, v in vars(self).items()})
 
         def mem_usage_bytes(self):
             return sum(get_tensor_size_bytes(t) for t in vars(self).values())

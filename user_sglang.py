@@ -1,7 +1,7 @@
 import requests
 import json
 
-SERVER_URL = "http://127.0.0.1:30000"
+SERVER_URL = "http://127.0.0.1:30001"
 
 # Avoid picking up HTTP(S)_PROXY from the environment for local calls.
 _SESSION = requests.Session()
@@ -62,7 +62,7 @@ def chat_with_sglang(
 def lm_completion(
     prompt: str,
     temperature: float = 0.0,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 2048,
     repetition_penalty: float = 1.0,
     use_chat_template: bool = True,  # 新增开关参数
 ):
@@ -101,7 +101,9 @@ def lm_completion(
 
 if __name__ == "__main__":
     # 例子，演示使用开关
-    prompt = "Once a upon a time in a land far, far away, there lived a"
+    prompt="""
+Who are you?
+    """
 
     # # 设置 use_chat_template 为 True，使用带系统提示的 chat 模式
     # out, raw = lm_completion(prompt, use_chat_template=True)
@@ -110,6 +112,6 @@ if __name__ == "__main__":
 
     # 设置 use_chat_template 为 False，使用原始 prompt    
     # Match HF generate() example: greedy + mild repetition penalty.
-    out, raw = lm_completion(prompt, max_new_tokens=128, repetition_penalty=1.05, use_chat_template=False)
+    out, raw = lm_completion(prompt, max_new_tokens=128, repetition_penalty=1.00, use_chat_template=True)
     print("=== LM completion ===")
     print(out)

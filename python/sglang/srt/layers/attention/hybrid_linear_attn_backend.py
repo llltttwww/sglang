@@ -530,6 +530,163 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
 
         ssm_states = mamba_cache_params.temporal
 
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        if is_target_verify:
+            assert forward_batch.spec_info is not None
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            intermediate_state_cache = mamba_cache_params.intermediate_ssm
+            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
+            assert isinstance(intermediate_conv_window_cache, list) and len(
+                intermediate_conv_window_cache
+            ) == 3, (
+                f"Unexpected KDA intermediate conv cache container: {type(intermediate_conv_window_cache)=}, "
+                f"{getattr(intermediate_conv_window_cache, '__len__', lambda: None)()=}"
+            )
+
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            seq_len = q_proj_states.shape[0]
+            num_heads = q_proj_states.shape[-1] // head_dim
+
+            if query_start_loc.numel() <= 1 or seq_len == 0:
+                return q_proj_states.new_empty((1, 0, num_heads, head_dim))
+
+            q_lens = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
+            active_req_mask = q_lens > 0
+            if active_req_mask.any():
+                active_req_indices = torch.nonzero(
+                    active_req_mask, as_tuple=False
+                ).squeeze(-1)
+            else:
+                active_req_indices = query_start_loc.new_empty((0,), dtype=torch.int64)
+
+            batch_size = int(active_req_indices.numel())
+            if batch_size == 0:
+                # All sequences are padded (CUDA-graph verify), nothing to compute.
+                return q_proj_states.new_empty((1, 0, num_heads, head_dim))
+
+            if not torch.all(q_lens.index_select(0, active_req_indices) == draft_token_num):
+                raise ValueError(
+                    "KimiLinearAttnBackend target_verify expects fixed q_len==draft_token_num per active req, "
+                    f"but got {q_lens.index_select(0, active_req_indices).tolist()=} and {draft_token_num=}."
+                )
+
+            base_offsets = query_start_loc.index_select(0, active_req_indices).to(
+                torch.int64
+            )
+            cache_indices_i64 = cache_indices.to(torch.int64).index_select(
+                0, active_req_indices
+            )
+            valid_cache_mask = cache_indices_i64 >= 0
+            if not bool(valid_cache_mask.all().item()):
+                raise ValueError(
+                    f"Invalid mamba cache indices in target_verify: {cache_indices_i64=}"
+                )
+
+            pad_conv_idx = conv_state_q.shape[0] - 1
+            safe_cache_idx = torch.where(
+                valid_cache_mask,
+                cache_indices_i64,
+                torch.full_like(cache_indices_i64, pad_conv_idx),
+            ).to(torch.int64)
+
+            pad_state_idx = ssm_states.shape[0] - 1
+            safe_state_idx = torch.where(
+                valid_cache_mask,
+                cache_indices_i64,
+                torch.full_like(cache_indices_i64, pad_state_idx),
+            ).to(torch.int64)
+
+            # Local state buffers: do NOT update the global cache during verify.
+            cur_conv_q = conv_state_q.index_select(0, safe_cache_idx).contiguous()
+            cur_conv_k = conv_state_k.index_select(0, safe_cache_idx).contiguous()
+            cur_conv_v = conv_state_v.index_select(0, safe_cache_idx).contiguous()
+            cur_ssm_state = ssm_states.index_select(0, safe_state_idx).contiguous()
+
+            cu_seqlens_step = torch.arange(
+                0,
+                batch_size + 1,
+                dtype=query_start_loc.dtype,
+                device=query_start_loc.device,
+            )
+
+            def _step_conv(
+                x_2d: torch.Tensor,
+                state: torch.Tensor,
+                w: torch.Tensor,
+                b: torch.Tensor,
+            ):
+                y, next_state = fla_conv.causal_conv1d(
+                    x=x_2d.unsqueeze(0),
+                    weight=w,
+                    bias=b,
+                    residual=None,
+                    initial_state=state,
+                    output_final_state=True,
+                    activation="silu",
+                    backend="triton",
+                    cu_seqlens=cu_seqlens_step,
+                )
+                return y.squeeze(0), next_state
+
+            core_attn_out = None
+            for step in range(draft_token_num):
+                token_indices = (base_offsets + step).to(torch.int64)
+
+                hs_step = hidden_states.index_select(0, token_indices)
+                q_in = q_proj_states.index_select(0, token_indices)
+                k_in = k_proj_states.index_select(0, token_indices)
+                v_in = v_proj_states.index_select(0, token_indices)
+
+                q_step, cur_conv_q = _step_conv(
+                    q_in, cur_conv_q, q_conv_weights, q_conv_bias
+                )
+                k_step, cur_conv_k = _step_conv(
+                    k_in, cur_conv_k, k_conv_weights, k_conv_bias
+                )
+                v_step, cur_conv_v = _step_conv(
+                    v_in, cur_conv_v, v_conv_weights, v_conv_bias
+                )
+
+                q_step, k_step, v_step = map(
+                    lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim),
+                    (q_step, k_step, v_step),
+                )
+
+                beta = b_proj(hs_step)[0].float().sigmoid().unsqueeze(0)  # [1, N, H]
+                g = f_b_proj(f_a_proj(hs_step)[0])[0]
+                g = fla_fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias).unsqueeze(
+                    0
+                )  # [1, N, H, D]
+
+                out_step, cur_ssm_state = fla_fused_recurrent_kda(
+                    q=q_step,
+                    k=k_step,
+                    v=v_step,
+                    g=g,
+                    beta=beta,
+                    initial_state=cur_ssm_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu_seqlens_step,
+                )
+                # Match the decode path semantics: the persistent cache lives in
+                # `ssm_states` dtype (typically bf16). Quantize between steps.
+                cur_ssm_state = cur_ssm_state.to(ssm_states.dtype, copy=False)
+
+                if core_attn_out is None:
+                    core_attn_out = out_step.new_empty(
+                        (1, seq_len) + out_step.shape[2:]
+                    )
+                core_attn_out.index_copy_(1, token_indices, out_step)
+
+                # Cache intermediate states per step for post-verify commit.
+                intermediate_state_cache[safe_state_idx, step] = cur_ssm_state
+                intermediate_conv_window_cache[0][safe_cache_idx, step] = cur_conv_q
+                intermediate_conv_window_cache[1][safe_cache_idx, step] = cur_conv_k
+                intermediate_conv_window_cache[2][safe_cache_idx, step] = cur_conv_v
+
+            return core_attn_out
+
         cache_indices_i64 = cache_indices.to(torch.int64)
         valid_mask = cache_indices_i64 >= 0
         pad_idx = conv_state_q.shape[0] - 1
@@ -583,7 +740,14 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         # HF reference uses fused_recurrent_kda for short prefill (q_len <= 64),
         # and chunk_kda for longer sequences.
         seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        if isinstance(seq_lens_cpu, list):
+        if seq_lens_cpu is None:
+            # Some speculative verify/padded extend paths may not populate
+            # `extend_seq_lens_cpu`. Derive q lengths from `cu_seqlens`.
+            if query_start_loc.numel() > 1:
+                max_q_len = int((query_start_loc[1:] - query_start_loc[:-1]).max().item())
+            else:
+                max_q_len = 0
+        elif isinstance(seq_lens_cpu, list):
             max_q_len = max(seq_lens_cpu) if seq_lens_cpu else 0
         else:
             max_q_len = int(seq_lens_cpu.max().item())
@@ -1105,6 +1269,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         ].to(ssm_states.dtype, copy=False)
 
         # Scatter into conv_states at the chosen cache lines
-        conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
-            :, valid_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        if isinstance(conv_states, list):
+            assert isinstance(intermediate_conv_window_cache, list) and len(
+                intermediate_conv_window_cache
+            ) == len(conv_states), (
+                f"KDA conv cache mismatch: {len(conv_states)=}, {len(intermediate_conv_window_cache)=}"
+            )
+            for i in range(len(conv_states)):
+                conv_states[i][:, valid_state_indices, :, :] = (
+                    intermediate_conv_window_cache[i][:, valid_state_indices, last_steps]
+                    .to(conv_states[i].dtype, copy=False)
+                )
+        else:
+            conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
+                :, valid_state_indices, last_steps
+            ].to(conv_states.dtype, copy=False)

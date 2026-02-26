@@ -1324,51 +1324,88 @@ class ModelRunner:
             num_layers = len(config.full_attention_layer_ids)
         else:
             num_layers = self.num_effective_layers
-        if self.use_mla_backend:
-            cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * torch._utils._element_size(self.kv_cache_dtype)
-            )
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                cell_size = (cell_size // 2) + (
-                    (
-                        (
-                            self.model_config.kv_lora_rank
-                            + self.model_config.qk_rope_head_dim
-                        )
-                        // scale_block_size
-                    )
-                    * num_layers
+        def _kv_cell_size(layer_count: int) -> int:
+            """Return KV-cache bytes per token for `layer_count` layers.
+
+            Note: For EAGLE/standalone speculative decoding, target and draft workers
+            allocate *separate* KV-cache pools with the same token capacity (shared
+            allocator). So the effective bytes-per-token should include both pools.
+            """
+            if layer_count <= 0:
+                return 0
+            if self.use_mla_backend:
+                cell = (
+                    (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                    * layer_count
                     * torch._utils._element_size(self.kv_cache_dtype)
                 )
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    # kv_scale_buffer
+                    scale_block_size = 16
+                    cell = (cell // 2) + (
+                        (
+                            (
+                                self.model_config.kv_lora_rank
+                                + self.model_config.qk_rope_head_dim
+                            )
+                            // scale_block_size
+                        )
+                        * layer_count
+                        * torch._utils._element_size(self.kv_cache_dtype)
+                    )
 
-            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-            if is_deepseek_nsa(self.model_config.hf_config):
-                index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                cell_size += indexer_size_per_token * num_layers * element_size
-        else:
-            cell_size = (
+                # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
+                if is_deepseek_nsa(self.model_config.hf_config):
+                    index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
+                    cell += indexer_size_per_token * layer_count * element_size
+                return cell
+
+            return (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
                 * self.model_config.head_dim
-                * num_layers
+                * layer_count
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+
+        cell_size = _kv_cell_size(num_layers)
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
+
+        # EAGLE/standalone speculative decoding creates a draft worker that shares the
+        # token allocator with the target worker, but allocates its own KV-cache pool.
+        # If we profile KV capacity with only the target pool, the draft pool can
+        # OOM during initialization (especially for hybrid models with small KV
+        # layer counts, where max_total_num_tokens becomes very large).
+        if (
+            (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
+            and (not self.is_draft_worker)
+        ):
+            hf_cfg = self.model_config.hf_config
+            draft_layers = getattr(hf_cfg, "mtp_num_layers", None)
+            if draft_layers is None:
+                draft_layers = getattr(hf_cfg, "num_nextn_predict_layers", None)
+            if draft_layers is None:
+                # Fallback: conservatively assume the draft KV footprint matches the
+                # target KV footprint.
+                draft_layers = num_layers
+            try:
+                draft_layers = int(draft_layers)
+            except Exception:
+                draft_layers = num_layers
+            draft_layers = max(draft_layers, 0)
+
+            cell_size += _kv_cell_size(draft_layers)
         # For "all-linear" (no full-attention layers), KV cache cell_size becomes 0.
         # In this case we still need a non-zero token capacity for request bookkeeping
         # (req_to_token mapping, radix cache indices, etc.), but it should not be
