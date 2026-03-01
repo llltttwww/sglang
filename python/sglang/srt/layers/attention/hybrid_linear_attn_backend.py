@@ -350,7 +350,6 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         q_conv_state, k_conv_state, v_conv_state = conv_states
 
         ssm_states = layer_cache.temporal
-        query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         # q_conv_state = q_conv_state.transpose(-1, -2)
@@ -375,10 +374,11 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             # Using causal_conv1d(backend="triton") with q_len=1 keeps it graph-safe
             # while remaining functionally equivalent.
             #
-            # x_2d: [N, D] -> [1, N, D] (varlen via cu_seqlens=query_start_loc)
+            # x_2d: [N, D] -> [N, 1, D] (each sequence has length 1)
+            x_2d = x_2d * valid_mask.to(dtype=x_2d.dtype).unsqueeze(-1)
             cache_sel = cache_full.index_select(0, safe_idx).contiguous()
             y, cache_sel = fla_conv.causal_conv1d(
-                x=x_2d.unsqueeze(0),
+                x=x_2d.unsqueeze(1),
                 weight=w,
                 bias=b,
                 residual=None,
@@ -386,13 +386,12 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
                 output_final_state=True,
                 activation="silu",
                 backend="triton",
-                cu_seqlens=query_start_loc,
             )
             # Scatter updated caches back. This is CUDA-graph friendly:
             # no data-dependent control flow or dynamic-shape indexing.
             cache_full.index_copy_(0, safe_idx, cache_sel)
 
-            y = y.squeeze(0)
+            y = y.squeeze(1)
             # Zero-out padded rows without boolean indexing.
             y = y * valid_mask.to(dtype=y.dtype).unsqueeze(-1)
             return y
@@ -401,18 +400,19 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
         k = _decode_conv(k_proj_states, k_conv_state, k_conv_weights, k_conv_bias)
         v = _decode_conv(v_proj_states, v_conv_state, v_conv_weights, v_conv_bias)
 
-        # SGLang uses packed (varlen) decoding: B=1, T=sum(seq_lens)=bs, with cu_seqlens.
         q, k, v = map(
-            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
+            lambda x: rearrange(x, "n (h d) -> n 1 h d", d=head_dim), (q, k, v)
         )
 
         beta = b_proj(hidden_states)[0].float().sigmoid()  # [N, H]
+        beta = beta * valid_mask.to(dtype=beta.dtype).unsqueeze(-1)
 
         g = f_b_proj(f_a_proj(hidden_states)[0])[0]
         g = fla_fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)  # [N, H, D]
+        g = g * valid_mask.to(dtype=g.dtype).unsqueeze(-1).unsqueeze(-1)
 
-        beta = beta.unsqueeze(0)  # [1, N, H]
-        g = g.unsqueeze(0)  # [1, N, H, D]
+        beta = beta.unsqueeze(1)  # [N, 1, H]
+        g = g.unsqueeze(1)  # [N, 1, H, D]
 
         pad_state_idx = ssm_states.shape[0] - 1
         safe_state_idx = torch.where(
@@ -433,10 +433,15 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             initial_state=initial_state,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=query_start_loc,
         )
         ssm_states.index_copy_(
             0, safe_state_idx, last_recurrent_state.to(ssm_states.dtype, copy=False)
+        )
+        core_attn_out = core_attn_out.view(
+            1,
+            core_attn_out.shape[0],
+            core_attn_out.shape[2],
+            core_attn_out.shape[3],
         )
         
         # def debug_check(name: str, x: torch.Tensor):
@@ -550,25 +555,42 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
             if query_start_loc.numel() <= 1 or seq_len == 0:
                 return q_proj_states.new_empty((1, 0, num_heads, head_dim))
 
-            q_lens = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
-            active_req_mask = q_lens > 0
-            if active_req_mask.any():
-                active_req_indices = torch.nonzero(
-                    active_req_mask, as_tuple=False
-                ).squeeze(-1)
-            else:
-                active_req_indices = query_start_loc.new_empty((0,), dtype=torch.int64)
+            # CUDA graph capture forbids converting CUDA tensors to Python bools
+            # (e.g., `if active_req_mask.any():`). Use a capture-safe fast path.
+            is_cudagraph_capture = False
+            try:
+                from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-            batch_size = int(active_req_indices.numel())
-            if batch_size == 0:
-                # All sequences are padded (CUDA-graph verify), nothing to compute.
-                return q_proj_states.new_empty((1, 0, num_heads, head_dim))
+                is_cudagraph_capture = get_is_capture_mode()
+            except Exception:
+                if hasattr(torch.cuda, "is_current_stream_capturing"):
+                    try:
+                        is_cudagraph_capture = torch.cuda.is_current_stream_capturing()
+                    except Exception:
+                        is_cudagraph_capture = False
 
-            if not torch.all(q_lens.index_select(0, active_req_indices) == draft_token_num):
-                raise ValueError(
-                    "KimiLinearAttnBackend target_verify expects fixed q_len==draft_token_num per active req, "
-                    f"but got {q_lens.index_select(0, active_req_indices).tolist()=} and {draft_token_num=}."
+            if is_cudagraph_capture:
+                batch_size = int(query_start_loc.numel() - 1)
+                active_req_indices = torch.arange(
+                    batch_size,
+                    device=query_start_loc.device,
+                    dtype=torch.int64,
                 )
+            else:
+                q_lens = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
+                active_req_mask = q_lens > 0
+                active_req_indices = torch.nonzero(active_req_mask, as_tuple=False).squeeze(-1)
+
+                batch_size = int(active_req_indices.numel())
+                if batch_size == 0:
+                    # All sequences are padded (CUDA-graph verify), nothing to compute.
+                    return q_proj_states.new_empty((1, 0, num_heads, head_dim))
+
+                if not torch.all(q_lens.index_select(0, active_req_indices) == draft_token_num).item():
+                    raise ValueError(
+                        "KimiLinearAttnBackend target_verify expects fixed q_len==draft_token_num per active req, "
+                        f"but got {q_lens.index_select(0, active_req_indices).tolist()=} and {draft_token_num=}."
+                    )
 
             base_offsets = query_start_loc.index_select(0, active_req_indices).to(
                 torch.int64
@@ -577,7 +599,7 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
                 0, active_req_indices
             )
             valid_cache_mask = cache_indices_i64 >= 0
-            if not bool(valid_cache_mask.all().item()):
+            if (not is_cudagraph_capture) and (not bool(valid_cache_mask.all().item())):
                 raise ValueError(
                     f"Invalid mamba cache indices in target_verify: {cache_indices_i64=}"
                 )
@@ -615,8 +637,13 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
                 w: torch.Tensor,
                 b: torch.Tensor,
             ):
+                # NOTE: Do not pass `cu_seqlens` here.
+                # `fla.ops.utils.prepare_chunk_indices()` uses `.tolist()` internally, which is not
+                # allowed during CUDA graph capture ("operation not permitted when stream is capturing").
+                # This step processes exactly 1 token per sequence, so we can run in regular
+                # batched mode: x: [N, 1, D], initial_state: [N, D, W].
                 y, next_state = fla_conv.causal_conv1d(
-                    x=x_2d.unsqueeze(0),
+                    x=x_2d.unsqueeze(1),
                     weight=w,
                     bias=b,
                     residual=None,
@@ -624,9 +651,8 @@ class KimiLinearAttnBackend(MambaAttnBackendBase):
                     output_final_state=True,
                     activation="silu",
                     backend="triton",
-                    cu_seqlens=cu_seqlens_step,
                 )
-                return y.squeeze(0), next_state
+                return y.squeeze(1), next_state
 
             core_attn_out = None
             for step in range(draft_token_num):

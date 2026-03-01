@@ -186,7 +186,30 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             kv_indices,
             req_to_token.size(1),
         )
-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
+        custom_mask = self.custom_mask
+        if custom_mask is not None:
+            # During CUDA-graph replay we may pad the batch size to a captured `bs`.
+            # `qo_indptr/kv_indptr` are generated using the padded `batch_size`, but
+            # `custom_mask` (tree mask) is built for the raw batch. FlashInfer expects
+            # `custom_mask` to have length sum_i(q_len_i * kv_len_i); otherwise it may
+            # read out-of-bounds and trigger CUDA illegal memory access.
+            expected_mask_len = (
+                int(paged_kernel_lens_sum) * self.draft_token_num
+                + batch_size * self.draft_token_num * self.draft_token_num
+            )
+            if custom_mask.numel() != expected_mask_len:
+                padded_mask = torch.full(
+                    (expected_mask_len,),
+                    True,
+                    dtype=custom_mask.dtype,
+                    device=custom_mask.device,
+                )
+                copy_len = min(custom_mask.numel(), expected_mask_len)
+                if copy_len:
+                    padded_mask[:copy_len].copy_(custom_mask[:copy_len])
+                custom_mask = padded_mask
+
+        return kv_indices, cum_kv_seq_len, qo_indptr, custom_mask
 
     def verify(
         self,
