@@ -195,6 +195,11 @@ class ExpertLocationMetadata:
 
         if model_config_for_expert_location is None:
             return None
+        if (
+            model_config_for_expert_location.num_layers <= 0
+            or model_config_for_expert_location.num_logical_experts <= 0
+        ):
+            return None
 
         num_physical_experts = (
             model_config_for_expert_location.num_logical_experts

@@ -565,7 +565,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ret = await _global_state.tokenizer_manager.generate_request(
                 obj, request
             ).__anext__()
-            return ret
+            # Use ORJSONResponse to avoid failing on non-finite floats (NaN/Inf) in
+            # debug metadata (e.g. logprobs). Starlette's default JSONResponse
+            # rejects them and raises:
+            #   ValueError: Out of range float values are not JSON compliant: nan
+            return ORJSONResponse(ret, status_code=HTTPStatus.OK)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)

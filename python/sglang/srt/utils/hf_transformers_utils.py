@@ -129,6 +129,113 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
+def _qwen3_checkpoint_has_moe_weights(model_dir: str) -> Optional[bool]:
+    """Best-effort check whether a Qwen3 checkpoint contains MoE expert weights.
+
+    Returns:
+        - True: found expert-related weight names
+        - False: found dense MLP weights and no expert weights
+        - None: unable to determine
+    """
+    if not model_dir or not os.path.isdir(model_dir):
+        return None
+
+    # Prefer safetensors index if present (cheap, does not touch large tensors).
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(model_dir, index_name)
+        if not os.path.exists(index_path):
+            continue
+        try:
+            with open(index_path, "r") as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map") or {}
+            if not isinstance(weight_map, dict):
+                continue
+            keys = weight_map.keys()
+            if any(".mlp.experts." in k or "mlp.experts." in k for k in keys):
+                return True
+            # Dense checkpoints typically have gate_proj/up_proj/down_proj under mlp.
+            if any(".mlp.gate_proj.weight" in k for k in keys):
+                return False
+        except Exception:
+            continue
+
+    # Fallback: peek at the first safetensors file.
+    try:
+        from safetensors import safe_open  # type: ignore
+    except Exception:
+        return None
+
+    candidates: List[str] = []
+    for name in ("model.safetensors", "model-00000-of-00001.safetensors"):
+        p = os.path.join(model_dir, name)
+        if os.path.exists(p):
+            candidates.append(p)
+    if not candidates:
+        try:
+            for fname in os.listdir(model_dir):
+                if fname.endswith(".safetensors"):
+                    candidates.append(os.path.join(model_dir, fname))
+                    break
+        except Exception:
+            return None
+
+    for ckpt_path in candidates:
+        try:
+            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
+                keys = f.keys()
+                if any(".mlp.experts." in k or "mlp.experts." in k for k in keys):
+                    return True
+                if any(".mlp.gate_proj.weight" in k for k in keys):
+                    return False
+        except Exception:
+            continue
+
+    return None
+
+
+def _maybe_disable_qwen3_moe_for_dense_checkpoint(
+    config: PretrainedConfig, model_path: Union[str, Path]
+) -> None:
+    """Some internal Qwen3 dense checkpoints omit MoE fields in config.json.
+
+    Our Qwen3 config classes have MoE defaults, which can cause the server to
+    instantiate a huge MoE model and leave most expert weights uninitialized
+    (since the checkpoint is dense), leading to NaNs during inference.
+    """
+    if getattr(config, "model_type", None) not in ("qwen3_next", "qwen3_kimi"):
+        return
+    if not isinstance(model_path, str):
+        return
+    if not os.path.isdir(model_path):
+        return
+
+    has_moe = _qwen3_checkpoint_has_moe_weights(model_path)
+    if has_moe is not False:
+        return
+
+    # Dense checkpoint detected. Disable MoE-related config so model code can
+    # fall back to dense MLPs.
+    if getattr(config, "num_experts", 0) > 0:
+        logger.warning(
+            "Detected a dense Qwen3 checkpoint (no MoE expert weights found). "
+            "Overriding config to disable MoE for: %s",
+            model_path,
+        )
+
+    num_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+    config.update(
+        {
+            "num_experts": 0,
+            "num_experts_per_tok": 0,
+            "moe_intermediate_size": 0,
+            "shared_expert_intermediate_size": 0,
+            "decoder_sparse_step": 0,
+            "mlp_only_layers": list(range(num_layers)) if num_layers > 0 else [],
+        }
+    )
+
+
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
@@ -296,6 +403,8 @@ def get_config(
         config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
+
+    _maybe_disable_qwen3_moe_for_dense_checkpoint(config, model)
 
     if isinstance(model, str) and config.model_type == "internvl_chat":
         for key, val in config.llm_config.__dict__.items():

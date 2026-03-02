@@ -698,9 +698,14 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 config, layer_id, quant_config, alt_stream
             )
 
-        # Qwen3Next all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_previous_layer_sparse = True
+        # Some Qwen3 checkpoints are dense (no MoE expert weights). In that case,
+        # disable sparse MoE MLPs and fall back to dense MLP.
+        self.is_layer_sparse = (
+            getattr(config, "num_experts", 0) > 0
+            and getattr(config, "num_experts_per_tok", 0) > 0
+            and getattr(config, "moe_intermediate_size", 0) > 0
+        )
+        is_previous_layer_sparse = self.is_layer_sparse
         self.layer_id = layer_id
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -853,9 +858,14 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Qwen3Next all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_previous_layer_sparse = True
+        # Some Qwen3 checkpoints are dense (no MoE expert weights). In that case,
+        # disable sparse MoE MLPs and fall back to dense MLP.
+        self.is_layer_sparse = (
+            getattr(config, "num_experts", 0) > 0
+            and getattr(config, "num_experts_per_tok", 0) > 0
+            and getattr(config, "moe_intermediate_size", 0) > 0
+        )
+        is_previous_layer_sparse = self.is_layer_sparse
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -1115,6 +1125,7 @@ class Qwen3NextForCausalLM(nn.Module):
 
     def _debug_check_kimi_linear_weights(self):
         print("[SANITY] checking Kimi linear-attn weights for NaN/Inf...")
+        matched = 0
         for i, layer in enumerate(self.model.layers):
             if not isinstance(layer, Qwen3HybridLinearDecoderLayer):
                 continue
@@ -1135,6 +1146,13 @@ class Qwen3NextForCausalLM(nn.Module):
                     f"nan={has_nan}, inf={has_inf}, "
                     f"min={w.min().item():.4f}, max={w.max().item():.4f}"
                 )
+                matched += 1
+
+        if matched == 0:
+            print(
+                "[SANITY] no Kimi linear-attn modules found in this model; "
+                "skipping linear-attn weight NaN/Inf checks."
+            )
                 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1318,6 +1336,7 @@ class Qwen3NextForCausalLM(nn.Module):
 
         if Qwen3KimiDeltaAttention is not None:
             print("[SANITY] post-load Kimi linear-attn weights:")
+            matched = 0
             for name, module in self.model.named_modules():
                 if isinstance(module, Qwen3KimiDeltaAttention):
                     layer_id = module.layer_idx
@@ -1335,14 +1354,25 @@ class Qwen3NextForCausalLM(nn.Module):
                             f" nan={nan}, inf={inf}, "
                             f"min={w_safe.min().item():.4f}, max={w_safe.max().item():.4f}"
                         )
+                        matched += 1
+
+            if matched == 0:
+                print(
+                    "  (no Kimi linear-attn modules found; nothing to check for this model)"
+                )
         # print(f"[DEBUG] loaded weights keys + shapes written to {weights_log}")
         return loaded_params
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
+        num_experts = getattr(config, "num_experts", 0)
+        num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
+        moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
+        if num_experts <= 0 or num_experts_per_tok <= 0 or moe_intermediate_size <= 0:
+            return None
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
+            num_logical_experts=num_experts,
             num_groups=None,
         )
 
