@@ -988,10 +988,14 @@ def zero_experts_compute_triton(
     top_k = expert_indices.size(-1)
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
 
-    if zero_expert_type == "identity":
+    if zero_expert_type in ("identity", "copy"):
         zero_expert_mask = expert_indices < num_experts
         zero_expert_scales = expert_scales.clone()
         zero_expert_scales[zero_expert_mask] = 0.0
+    else:
+        raise ValueError(
+            f"Unsupported zero_expert_type for zero_experts_compute_triton: {zero_expert_type}"
+        )
 
     normal_expert_mask = expert_indices >= num_experts
     expert_indices[normal_expert_mask] = -1

@@ -227,12 +227,24 @@ class Qwen3NextZCESparseMoeBlock(Qwen2MoeSparseMoeBlock):
             layer_id=layer_id,
         )
 
+        # Keep ZCE enabled when num_zero_experts > 0.
+        # Training scripts may omit zero_experts_type (default None). In Megatron
+        # this behaves like non-copy mode, so we map None -> "zero" for inference.
+        self.num_zero_experts = int(getattr(config, "num_zero_experts", 0) or 0)
+        self.zero_experts_type = getattr(config, "zero_experts_type", None)
+        if self.num_zero_experts > 0 and self.zero_experts_type is None:
+            self.zero_experts_type = "zero"
+            logger.warning(
+                "zero_experts_type is None while num_zero_experts > 0; "
+                "defaulting to 'zero' to match training-side behavior."
+            )
+
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=config.num_experts_per_tok,
             num_experts=config.num_experts
             + get_global_server_args().ep_num_redundant_experts,
-            num_zero_experts=config.num_zero_experts,
+            num_zero_experts=self.num_zero_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -241,7 +253,7 @@ class Qwen3NextZCESparseMoeBlock(Qwen2MoeSparseMoeBlock):
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
-            config.num_experts + getattr(config, "num_zero_experts", 0),
+            config.num_experts + self.num_zero_experts,
             bias=False,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
@@ -264,8 +276,6 @@ class Qwen3NextZCESparseMoeBlock(Qwen2MoeSparseMoeBlock):
             self.shared_expert = None
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        self.zero_experts_type = config.zero_experts_type
-        self.num_zero_experts = config.num_zero_experts
         self.num_experts = config.num_experts
         
         if get_moe_a2a_backend().is_deepep():
@@ -359,7 +369,7 @@ class Qwen3NextZCESparseMoeBlock(Qwen2MoeSparseMoeBlock):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         # Add ZCE contributions
-        if zce_output and hidden_states.shape[0] > 0:
+        if zce_output is not None and hidden_states.shape[0] > 0:
             final_hidden_states += zce_output.to(final_hidden_states.device)
         
         return final_hidden_states.view(num_tokens, hidden_dim)
