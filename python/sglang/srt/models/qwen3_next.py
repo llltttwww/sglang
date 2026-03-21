@@ -70,6 +70,35 @@ import triton
 import triton.language as tl
 
 
+def _normalize_window_size(window_size):
+    if window_size is None:
+        return None
+    if isinstance(window_size, int):
+        return (window_size, 0)
+    if isinstance(window_size, (list, tuple)):
+        if len(window_size) == 0:
+            return None
+        if len(window_size) == 1:
+            return (int(window_size[0]), 0)
+        return (int(window_size[0]), int(window_size[1]))
+    return None
+
+
+def _is_layer_window_attention(window_size, window_attn_skip_freq, layer_number):
+    # layer_number is 1-indexed to match Megatron behavior.
+    if not window_size:
+        return False
+    if window_attn_skip_freq is None:
+        return True
+    if isinstance(window_attn_skip_freq, int):
+        return layer_number % window_attn_skip_freq != 0
+    if isinstance(window_attn_skip_freq, list):
+        return bool(window_attn_skip_freq[layer_number - 1])
+    raise ValueError(
+        f"Invalid window_attn_skip_freq: {type(window_attn_skip_freq)} {window_attn_skip_freq}"
+    )
+
+
 @triton.jit
 def fused_qkvzba_split_reshape_cat_kernel(
     mixed_qkv,
@@ -982,6 +1011,19 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.rope_scaling = getattr(config, "rope_scaling", None)
         self.partial_rotary_factor = config.partial_rotary_factor
         self.layer_id = layer_id
+        self.window_size = _normalize_window_size(getattr(config, "window_size", None))
+        self.window_attn_skip_freq = getattr(config, "window_attn_skip_freq", None)
+        self.use_sliding_window = _is_layer_window_attention(
+            self.window_size, self.window_attn_skip_freq, layer_id + 1
+        )
+        self.sliding_window_size = (
+            self.window_size[0] if self.use_sliding_window and self.window_size else -1
+        )
+        if self.window_size and self.window_size[1] not in (0,):
+            logger.warning_once(
+                "qwen3_next inference only supports causal SWA right-window=0; "
+                f"got right-window={self.window_size[1]}, ignoring it."
+            )
 
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
@@ -1025,6 +1067,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=self.sliding_window_size,
             prefix=f"{prefix}.attn",
         )
 
@@ -1332,6 +1375,20 @@ class Qwen3NextForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def get_attention_sliding_window_size(self):
+        window_size = _normalize_window_size(getattr(self.config, "window_size", None))
+        if not window_size:
+            return None
+        has_swa_layer = any(
+            hasattr(layer, "self_attn")
+            and hasattr(layer.self_attn, "attn")
+            and getattr(layer.self_attn.attn, "sliding_window_size", -1) not in (-1, None)
+            for layer in self.model.layers
+        )
+        if not has_swa_layer:
+            return None
+        return window_size[0]
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
